@@ -64,7 +64,13 @@ final class CapturePackage {
     }
 
     synchronized void writeJson(String relativePath, JSONObject json) throws IOException {
-        writeText(relativePath, json == null ? "{}" : json.toString(2));
+        final String content;
+        try {
+            content = json == null ? "{}" : json.toString(2);
+        } catch (Exception e) {
+            throw new IOException("JSON serialization failed", e);
+        }
+        writeText(relativePath, content);
     }
 
     synchronized void appendTextChunk(String relativePath, String chunk, boolean truncate) throws IOException {

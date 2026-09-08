@@ -61,3 +61,5 @@ Structured capture outputs do not intentionally persist cookie values, Authoriza
 ## Build
 
 The development branch uses Android API 36, Java 17, Gradle 9.5, and AGP 9.3.1. CI compiles unit/instrumentation sources and candidates before starting the API 36 emulator. The WebView instrumentation test uses the production 1440×900 / 160 dpi VirtualDisplay host, runs the real capture runtime against a synthetic Project-like composer with open/closed Shadow DOM, and verifies credential redaction plus composer evidence.
+
+Successful DEV source runs are handed to the trusted signer workflow installed on the default branch. The signer re-verifies repository/workflow/actor/SHA/artifact identity, APK package/version/permission allowlist and artifact digest before using the persistent Android signing identity, so subsequent DEV APKs can preserve the same update lineage when the repository signing secret is configured.

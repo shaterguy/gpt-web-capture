@@ -24,6 +24,7 @@ import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.junit.Assert.*;
@@ -49,9 +50,18 @@ public class CaptureScriptWebViewAndroidTest {
         TestBridge bridge = new TestBridge();
         boolean documentStartSupported = WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT);
 
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(() ->
+                hostRef.set(HeadlessWebViewHost.create(context)));
+
+        HeadlessWebViewHost host = hostRef.get();
+        assertNotNull(host);
+        assertTrue("production capture host fell back instead of creating a VirtualDisplay", host.isVirtualDisplay());
+        assertTrue("production VirtualDisplay WebView did not attach", waitForAttachment(host, 5_000L));
+        assertEquals(1440, HeadlessWebViewHost.WIDTH);
+        assertEquals(900, HeadlessWebViewHost.HEIGHT);
+        assertEquals(160, HeadlessWebViewHost.DENSITY_DPI);
+
         InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
-            HeadlessWebViewHost host = HeadlessWebViewHost.create(context);
-            hostRef.set(host);
             WebView web = host.webView();
             web.getSettings().setJavaScriptEnabled(true);
             web.getSettings().setDomStorageEnabled(true);
@@ -73,19 +83,11 @@ public class CaptureScriptWebViewAndroidTest {
             web.loadDataWithBaseURL(BASE_URL, HTML, "text/html", "UTF-8", null);
         });
 
-        HeadlessWebViewHost host = hostRef.get();
-        assertNotNull(host);
-        assertTrue("production capture host fell back instead of creating a VirtualDisplay", host.isVirtualDisplay());
-        assertTrue("production VirtualDisplay WebView is not attached", host.isWindowAttached());
-        assertEquals(1440, HeadlessWebViewHost.WIDTH);
-        assertEquals(900, HeadlessWebViewHost.HEIGHT);
-        assertEquals(160, HeadlessWebViewHost.DENSITY_DPI);
-
         assertTrue("fixture page did not load", pageLoaded.await(20, TimeUnit.SECONDS));
         String captureJs = readAsset(context, "capture.js");
         String token = "android-test-token";
         InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
-            WebView web = hostRef.get().webView();
+            WebView web = host.webView();
             web.evaluateJavascript(captureJs, ignored -> web.evaluateJavascript(
                     "window.__GPT_WEB_CAPTURE__.run('GPTCaptureBridge'," + JSONObject.quote(token) + ")", ignored2 -> {}));
         });
@@ -119,10 +121,21 @@ public class CaptureScriptWebViewAndroidTest {
         assertTrue("open shadow root missing", hasOpen);
         if (documentStartSupported) assertTrue("closed shadow root was not retained", hasClosed);
 
-        InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
-            HeadlessWebViewHost current = hostRef.get();
-            if (current != null) current.destroy();
-        });
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(host::destroy);
+    }
+
+    private static boolean waitForAttachment(HeadlessWebViewHost host, long timeoutMs) throws Exception {
+        long deadline = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(timeoutMs);
+        AtomicBoolean attached = new AtomicBoolean(false);
+        while (System.nanoTime() < deadline) {
+            InstrumentationRegistry.getInstrumentation().runOnMainSync(() ->
+                    attached.set(host.isWindowAttached()));
+            if (attached.get()) return true;
+            Thread.sleep(50L);
+        }
+        InstrumentationRegistry.getInstrumentation().runOnMainSync(() ->
+                attached.set(host.isWindowAttached()));
+        return attached.get();
     }
 
     private static String readAsset(Context context, String name) {

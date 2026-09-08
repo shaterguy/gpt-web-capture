@@ -3,6 +3,7 @@ package com.shaterguy.gptwebcapture;
 import android.net.Uri;
 import android.os.Handler;
 import android.os.Looper;
+import android.os.SystemClock;
 import android.webkit.WebView;
 
 import androidx.webkit.ScriptHandler;
@@ -16,6 +17,8 @@ final class HeadlessCaptureController {
         void onFailure(String message);
     }
 
+    private static final long ATTACH_TIMEOUT_MS = 5_000L;
+    private static final long ATTACH_POLL_MS = 50L;
     private static final long SETTLE_AFTER_FINISH_MS = 10_000L;
     private static final long FALLBACK_CAPTURE_MS = 30_000L;
 
@@ -29,6 +32,7 @@ final class HeadlessCaptureController {
     private HeadlessWebViewHost host;
     private TrafficRecorder traffic;
     private ScriptHandler hookHandler;
+    private long attachDeadlineUptimeMs;
 
     HeadlessCaptureController(MainActivity activity, String targetUrl, Callback callback) {
         this.activity = activity;
@@ -43,6 +47,37 @@ final class HeadlessCaptureController {
         }
         try {
             host = HeadlessWebViewHost.create(activity);
+            if (!host.isVirtualDisplay()) {
+                fail("VirtualDisplay creation failed; background capture requires the automation-style host");
+                return;
+            }
+            attachDeadlineUptimeMs = SystemClock.uptimeMillis() + ATTACH_TIMEOUT_MS;
+            awaitAttachmentThenLoad();
+        } catch (Exception e) {
+            fail(e.toString());
+        }
+    }
+
+    void cancel() {
+        if (finished.compareAndSet(false, true)) cleanup();
+    }
+
+    private void awaitAttachmentThenLoad() {
+        if (finished.get() || host == null) return;
+        if (host.isWindowAttached()) {
+            configureAndLoad();
+            return;
+        }
+        if (SystemClock.uptimeMillis() >= attachDeadlineUptimeMs) {
+            fail("VirtualDisplay WebView did not attach within " + ATTACH_TIMEOUT_MS + " ms");
+            return;
+        }
+        handler.postDelayed(this::awaitAttachmentThenLoad, ATTACH_POLL_MS);
+    }
+
+    private void configureAndLoad() {
+        if (finished.get() || host == null) return;
+        try {
             traffic = new TrafficRecorder();
             WebView webView = host.webView();
             WebViewProfile.configure(activity, webView, traffic, (view, url) -> {
@@ -57,10 +92,6 @@ final class HeadlessCaptureController {
         } catch (Exception e) {
             fail(e.toString());
         }
-    }
-
-    void cancel() {
-        if (finished.compareAndSet(false, true)) cleanup();
     }
 
     private void scheduleCapture(long delayMs) {

@@ -1,0 +1,240 @@
+name: Sign GPT Web Capture DEV APK
+run-name: GPT Web Capture trusted DEV signer for source run ${{ github.event.workflow_run.id }}
+
+on:
+  workflow_run:
+    workflows:
+      - Build GPT Web Capture DEV APK
+    types:
+      - completed
+    branches:
+      - 'v*-dev*'
+
+permissions:
+  contents: read
+  actions: read
+
+env:
+  TRUSTED_REPOSITORY_ID: '1361985030'
+  TRUSTED_ACTOR: shaterguy
+  TRUSTED_ACTOR_ID: '108107617'
+  SOURCE_WORKFLOW_PATH: .github/workflows/android-dev.yml
+  DEV_PACKAGE: com.shaterguy.gptwebcapture.dev
+  DEV_APP_LABEL: GPT Web Capture DEV
+  EXPECTED_PUBLIC_CERT_SHA256: 3cfe95acd09077a89cd8de85434cbd5d8bb3e2021d8e9eacb804a8da9ccce52a
+  MAX_ARCHIVE_BYTES: '40000000'
+  MAX_APK_BYTES: '30000000'
+
+concurrency:
+  group: gpt-web-capture-trusted-dev-signer-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  sign-dev:
+    if: ${{ github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - name: Validate trusted source run
+        id: source
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          SOURCE_RUN_ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: |
+          set -euo pipefail
+          [[ "$SOURCE_RUN_ID" =~ ^[0-9]+$ ]]
+          [[ "$SOURCE_RUN_ATTEMPT" =~ ^[1-9][0-9]*$ ]]
+          RUN_JSON="$RUNNER_TEMP/source-run.json"
+          gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID" > "$RUN_JSON"
+          [[ "$(jq -r '.repository.id' "$RUN_JSON")" == "$TRUSTED_REPOSITORY_ID" ]]
+          [[ "$(jq -r '.head_repository.id' "$RUN_JSON")" == "$TRUSTED_REPOSITORY_ID" ]]
+          [[ "$(jq -r '.event' "$RUN_JSON")" == 'push' ]]
+          [[ "$(jq -r '.path' "$RUN_JSON")" == "$SOURCE_WORKFLOW_PATH" ]]
+          [[ "$(jq -r '.conclusion' "$RUN_JSON")" == 'success' ]]
+          [[ "$(jq -r '.actor.login' "$RUN_JSON")" == "$TRUSTED_ACTOR" ]]
+          [[ "$(jq -r '.actor.id' "$RUN_JSON")" == "$TRUSTED_ACTOR_ID" ]]
+          HEAD_BRANCH="$(jq -r '.head_branch' "$RUN_JSON")"
+          HEAD_SHA="$(jq -r '.head_sha' "$RUN_JSON")"
+          [[ "$HEAD_BRANCH" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-dev([1-9][0-9]*)$ ]]
+          MAJOR="${BASH_REMATCH[1]}"; MINOR="${BASH_REMATCH[2]}"; PATCH="${BASH_REMATCH[3]}"; DEV_NUMBER="${BASH_REMATCH[4]}"
+          (( 10#$MAJOR == 0 ))
+          VERSION_NAME="${HEAD_BRANCH#v}"
+          VERSION_CODE="$((10#$MINOR * 1000000 + 10#$PATCH * 1000 + 10#$DEV_NUMBER))"
+          [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]]
+          CURRENT_SHA="$(gh api "/repos/$GITHUB_REPOSITORY/git/ref/heads/$HEAD_BRANCH" --jq '.object.sha')"
+          [[ "$CURRENT_SHA" == "$HEAD_SHA" ]]
+          EXPECTED_ARTIFACT="gpt-web-capture-dev-${VERSION_NAME}-unsigned-attempt-${SOURCE_RUN_ATTEMPT}"
+          UNSIGNED_NAME="gpt-web-capture-dev-v${VERSION_NAME}-unsigned.apk"
+          SIGNED_NAME="gpt-web-capture-dev-v${VERSION_NAME}.apk"
+          printf 'head_branch=%s\n' "$HEAD_BRANCH" >> "$GITHUB_OUTPUT"
+          printf 'head_sha=%s\n' "$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          printf 'source_attempt=%s\n' "$SOURCE_RUN_ATTEMPT" >> "$GITHUB_OUTPUT"
+          printf 'version_name=%s\n' "$VERSION_NAME" >> "$GITHUB_OUTPUT"
+          printf 'version_code=%s\n' "$VERSION_CODE" >> "$GITHUB_OUTPUT"
+          printf 'artifact_name=%s\n' "$EXPECTED_ARTIFACT" >> "$GITHUB_OUTPUT"
+          printf 'unsigned_name=%s\n' "$UNSIGNED_NAME" >> "$GITHUB_OUTPUT"
+          printf 'signed_name=%s\n' "$SIGNED_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Check persistent signing material availability
+        id: signing
+        shell: bash
+        env:
+          SIGNING_BUNDLE_BASE64: ${{ secrets.CHATGPT_PUBLIC_SIGNING_BUNDLE_BASE64 }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$SIGNING_BUNDLE_BASE64" ]]; then
+            echo 'available=true' >> "$GITHUB_OUTPUT"
+          else
+            echo 'available=false' >> "$GITHUB_OUTPUT"
+            echo 'Persistent signing secret is not configured for this repository; installable debug artifact from the source workflow remains available.'
+          fi
+
+      - uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407
+        if: ${{ steps.signing.outputs.available == 'true' }}
+        with:
+          cmdline-tools-version: '11076708'
+          log-accepted-android-sdk-licenses: 'false'
+          packages: 'platform-tools build-tools;36.0.0'
+
+      - name: Download and verify exact source artifact
+        if: ${{ steps.signing.outputs.available == 'true' }}
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_RUN_ID: ${{ github.event.workflow_run.id }}
+          HEAD_SHA: ${{ steps.source.outputs.head_sha }}
+          EXPECTED_ARTIFACT: ${{ steps.source.outputs.artifact_name }}
+          UNSIGNED_NAME: ${{ steps.source.outputs.unsigned_name }}
+        run: |
+          set -euo pipefail
+          ARTIFACTS_JSON="$RUNNER_TEMP/source-artifacts.json"
+          gh api "/repos/$GITHUB_REPOSITORY/actions/runs/$SOURCE_RUN_ID/artifacts?per_page=100" > "$ARTIFACTS_JSON"
+          COUNT="$(jq --arg name "$EXPECTED_ARTIFACT" '[.artifacts[] | select(.name == $name and (.expired | not))] | length' "$ARTIFACTS_JSON")"
+          [[ "$COUNT" == '1' ]]
+          ARTIFACT_ID="$(jq -r --arg name "$EXPECTED_ARTIFACT" '.artifacts[] | select(.name == $name and (.expired | not)) | .id' "$ARTIFACTS_JSON")"
+          DIGEST="$(jq -r --arg name "$EXPECTED_ARTIFACT" '.artifacts[] | select(.name == $name and (.expired | not)) | .digest' "$ARTIFACTS_JSON")"
+          [[ "$ARTIFACT_ID" =~ ^[0-9]+$ ]]
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]]
+          ARCHIVE="$RUNNER_TEMP/source.zip"
+          curl --fail --silent --show-error --location --proto '=https' --tlsv1.2 \
+            -H 'Accept: application/vnd.github+json' \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H 'X-GitHub-Api-Version: 2022-11-28' \
+            "https://api.github.com/repos/$GITHUB_REPOSITORY/actions/artifacts/$ARTIFACT_ID/zip" \
+            --output "$ARCHIVE"
+          test -s "$ARCHIVE"
+          [[ "$(stat -c '%s' "$ARCHIVE")" -le "$MAX_ARCHIVE_BYTES" ]]
+          [[ "sha256:$(sha256sum "$ARCHIVE" | awk '{print $1}')" == "$DIGEST" ]]
+          EXTRACT="$RUNNER_TEMP/source"
+          mkdir -p "$EXTRACT"
+          python3 - "$ARCHIVE" "$EXTRACT" "$UNSIGNED_NAME" "$MAX_APK_BYTES" <<'PY'
+          import pathlib, stat, sys, zipfile
+          archive, out = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+          apk_name, max_apk = sys.argv[3], int(sys.argv[4])
+          expected = {apk_name, 'UNSIGNED_SHA256SUMS.txt', 'SOURCE_COMMIT.txt'}
+          with zipfile.ZipFile(archive) as zf:
+              infos = [i for i in zf.infolist() if not i.is_dir()]
+              names = {i.filename for i in infos}
+              if names != expected or len(infos) != 3:
+                  raise SystemExit(f'unexpected artifact members: {sorted(names)}')
+              for info in infos:
+                  path = pathlib.PurePosixPath(info.filename)
+                  if path.is_absolute() or '..' in path.parts or len(path.parts) != 1:
+                      raise SystemExit(f'unsafe artifact path: {info.filename}')
+                  if ((info.external_attr >> 16) & 0o170000) == stat.S_IFLNK:
+                      raise SystemExit(f'symlink forbidden: {info.filename}')
+                  if info.filename == apk_name and not (0 < info.file_size <= max_apk):
+                      raise SystemExit('invalid APK size')
+                  if info.filename != apk_name and not (0 < info.file_size <= 4096):
+                      raise SystemExit('invalid metadata size')
+                  with zf.open(info) as src, (out / info.filename).open('wb') as dst:
+                      while chunk := src.read(1024 * 1024): dst.write(chunk)
+          PY
+          [[ "$(tr -d '[:space:]' < "$EXTRACT/SOURCE_COMMIT.txt")" == "$HEAD_SHA" ]]
+          EXPECTED_SHA="$(awk '{print $1}' "$EXTRACT/UNSIGNED_SHA256SUMS.txt")"
+          EXPECTED_NAME="$(awk '{print $2}' "$EXTRACT/UNSIGNED_SHA256SUMS.txt")"; EXPECTED_NAME="${EXPECTED_NAME#\*}"
+          [[ "$EXPECTED_NAME" == "$UNSIGNED_NAME" ]]
+          [[ "$EXPECTED_SHA" =~ ^[0-9a-f]{64}$ ]]
+          [[ "$(sha256sum "$EXTRACT/$UNSIGNED_NAME" | awk '{print $1}')" == "$EXPECTED_SHA" ]]
+          unzip -t "$EXTRACT/$UNSIGNED_NAME" >/dev/null
+
+      - name: Validate unsigned manifest and permission allowlist
+        if: ${{ steps.signing.outputs.available == 'true' }}
+        shell: bash
+        env:
+          VERSION_NAME: ${{ steps.source.outputs.version_name }}
+          VERSION_CODE: ${{ steps.source.outputs.version_code }}
+          UNSIGNED_NAME: ${{ steps.source.outputs.unsigned_name }}
+        run: |
+          set -euo pipefail
+          BT="$ANDROID_HOME/build-tools/36.0.0"
+          APK="$RUNNER_TEMP/source/$UNSIGNED_NAME"
+          BADGING="$($BT/aapt dump badging "$APK")"
+          grep -Fq "package: name='$DEV_PACKAGE'" <<<"$BADGING"
+          grep -Fq "versionCode='$VERSION_CODE'" <<<"$BADGING"
+          grep -Fq "versionName='$VERSION_NAME'" <<<"$BADGING"
+          grep -Fq "application-label:'$DEV_APP_LABEL'" <<<"$BADGING"
+          grep -Fq "launchable-activity: name='com.shaterguy.gptwebcapture.MainActivity'" <<<"$BADGING"
+          PERMS="$($BT/aapt dump permissions "$APK" | sed -n "s/^uses-permission: name='\([^']*\)'.*/\1/p" | sort)"
+          EXPECTED="$(printf '%s\n' android.permission.ACCESS_NETWORK_STATE android.permission.INTERNET | sort)"
+          [[ "$PERMS" == "$EXPECTED" ]]
+          XML="$RUNNER_TEMP/manifest.txt"
+          "$BT/aapt" dump xmltree "$APK" AndroidManifest.xml > "$XML"
+          if grep -Eq '^\s*E: (service|receiver|provider|activity-alias)\b' "$XML"; then exit 1; fi
+
+      - name: Sign with persistent trusted identity
+        if: ${{ steps.signing.outputs.available == 'true' }}
+        shell: bash
+        env:
+          SIGNING_BUNDLE_BASE64: ${{ secrets.CHATGPT_PUBLIC_SIGNING_BUNDLE_BASE64 }}
+          UNSIGNED_NAME: ${{ steps.source.outputs.unsigned_name }}
+          SIGNED_NAME: ${{ steps.source.outputs.signed_name }}
+        run: |
+          set -euo pipefail
+          umask 077
+          WORK="$RUNNER_TEMP/signing"
+          rm -rf "$WORK" signed-output
+          mkdir -p "$WORK" signed-output
+          cleanup() { rm -rf "$WORK"; }
+          trap cleanup EXIT HUP INT TERM
+          printf '%s' "$SIGNING_BUNDLE_BASE64" | base64 --decode > "$WORK/bundle.tar.gz"
+          mapfile -t MEMBERS < <(tar -tzf "$WORK/bundle.tar.gz")
+          [[ "${#MEMBERS[@]}" -eq 2 ]]
+          printf '%s\n' "${MEMBERS[@]}" | grep -Fxq 'key.pk8'
+          printf '%s\n' "${MEMBERS[@]}" | grep -Fxq 'cert.pem'
+          if printf '%s\n' "${MEMBERS[@]}" | grep -Eq '(^/|(^|/)\.\.(/|$))'; then exit 1; fi
+          tar -xzf "$WORK/bundle.tar.gz" -C "$WORK" --no-same-owner --no-same-permissions
+          ACTUAL_CERT="$(openssl x509 -in "$WORK/cert.pem" -noout -fingerprint -sha256 | cut -d= -f2 | tr -d ':' | tr 'A-F' 'a-f')"
+          [[ "$ACTUAL_CERT" == "$EXPECTED_PUBLIC_CERT_SHA256" ]]
+          BT="$ANDROID_HOME/build-tools/36.0.0"
+          UNSIGNED="$RUNNER_TEMP/source/$UNSIGNED_NAME"
+          ALIGNED="$WORK/aligned.apk"
+          APK="signed-output/$SIGNED_NAME"
+          "$BT/zipalign" -p -f 4 "$UNSIGNED" "$ALIGNED"
+          "$BT/zipalign" -c -v 4 "$ALIGNED" >/dev/null
+          "$BT/apksigner" sign --key "$WORK/key.pk8" --cert "$WORK/cert.pem" --out "$APK" "$ALIGNED"
+          "$BT/apksigner" verify --verbose --print-certs "$APK" > signed-output/APK_CERT.txt
+          CERT_SHA256="$(awk -F': ' '/Signer #1 certificate SHA-256 digest:/ {print $2; exit}' signed-output/APK_CERT.txt | tr -d '[:space:]:' | tr '[:upper:]' '[:lower:]')"
+          [[ "$CERT_SHA256" == "$EXPECTED_PUBLIC_CERT_SHA256" ]]
+          "$BT/aapt" dump badging "$APK" > signed-output/APK_BADGING.txt
+          grep -Fq "package: name='$DEV_PACKAGE'" signed-output/APK_BADGING.txt
+          grep -Fq "versionName='${{ steps.source.outputs.version_name }}'" signed-output/APK_BADGING.txt
+          "$BT/zipalign" -c -v 4 "$APK" > signed-output/ZIPALIGN_VERIFY.txt
+          unzip -t "$APK" >/dev/null
+          printf '%s\n' "$CERT_SHA256" > signed-output/DEV_SIGNING_CERT_SHA256.txt
+          printf '%s\n' "${{ steps.source.outputs.head_sha }}" > signed-output/SOURCE_COMMIT.txt
+          printf '%s\n' "${{ github.event.workflow_run.id }}" > signed-output/SOURCE_RUN_ID.txt
+          printf '%s\n' "${{ steps.source.outputs.source_attempt }}" > signed-output/SOURCE_RUN_ATTEMPT.txt
+          (cd signed-output && sha256sum "$SIGNED_NAME" > SHA256SUMS.txt)
+
+      - name: Upload persistent-signed DEV APK
+        if: ${{ steps.signing.outputs.available == 'true' }}
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: gpt-web-capture-dev-${{ steps.source.outputs.version_name }}-signed-source-attempt-${{ steps.source.outputs.source_attempt }}-sign-attempt-${{ github.run_attempt }}
+          path: signed-output/*
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30

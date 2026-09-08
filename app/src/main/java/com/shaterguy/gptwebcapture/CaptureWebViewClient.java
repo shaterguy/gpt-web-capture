@@ -13,13 +13,23 @@ import android.webkit.WebViewClient;
 
 import java.util.Locale;
 
-final class CaptureWebViewClient extends WebViewClient {
+class CaptureWebViewClient extends WebViewClient {
+    interface PageListener {
+        void onPageFinished(WebView view, String url);
+    }
+
     private final Activity activity;
     private final TrafficRecorder recorder;
+    private final PageListener pageListener;
 
     CaptureWebViewClient(Activity activity, TrafficRecorder recorder) {
+        this(activity, recorder, null);
+    }
+
+    CaptureWebViewClient(Activity activity, TrafficRecorder recorder, PageListener pageListener) {
         this.activity = activity;
         this.recorder = recorder;
+        this.pageListener = pageListener;
     }
 
     static boolean isCaptureHost(String host) {
@@ -70,6 +80,7 @@ final class CaptureWebViewClient extends WebViewClient {
     public void onPageFinished(WebView view, String url) {
         recorder.recordPage("finished", url);
         super.onPageFinished(view, url);
+        if (pageListener != null) pageListener.onPageFinished(view, url);
     }
 
     @Override

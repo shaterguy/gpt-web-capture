@@ -7,8 +7,6 @@ import android.net.Uri;
 import android.os.Bundle;
 import android.view.Gravity;
 import android.view.ViewGroup;
-import android.webkit.CookieManager;
-import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.widget.Button;
 import android.widget.EditText;
@@ -16,16 +14,10 @@ import android.widget.LinearLayout;
 import android.widget.TextView;
 
 import androidx.webkit.ScriptHandler;
-import androidx.webkit.WebViewCompat;
-import androidx.webkit.WebViewFeature;
 
-import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.InputStream;
 import java.io.OutputStream;
-import java.nio.charset.StandardCharsets;
-import java.util.LinkedHashSet;
-import java.util.Set;
 
 public final class MainActivity extends Activity {
     private static final int REQUEST_EXPORT_ZIP = 4101;
@@ -35,9 +27,11 @@ public final class MainActivity extends Activity {
     private EditText address;
     private TextView status;
     private Button captureButton;
+    private Button headlessButton;
     private Button exportButton;
     private TrafficRecorder trafficRecorder;
     private DiagnosticRecorder diagnosticRecorder;
+    private HeadlessCaptureController headlessCaptureController;
     private File pendingZip;
     private boolean documentStartHookInstalled;
     private ScriptHandler hookScriptHandler;
@@ -47,8 +41,10 @@ public final class MainActivity extends Activity {
         super.onCreate(savedInstanceState);
         trafficRecorder = new TrafficRecorder();
         buildUi();
-        configureWebView();
-        documentStartHookInstalled = installDocumentStartHook();
+        WebView.setWebContentsDebuggingEnabled(BuildConfig.WEB_CONTENT_DEBUGGING);
+        WebViewProfile.configure(this, webView, trafficRecorder, null);
+        hookScriptHandler = WebViewProfile.installDocumentStartHook(this, webView, trafficRecorder);
+        documentStartHookInstalled = hookScriptHandler != null;
         diagnosticRecorder = new DiagnosticRecorder(this, webView, trafficRecorder, documentStartHookInstalled);
         webView.loadUrl(HOME_URL);
     }
@@ -85,69 +81,37 @@ public final class MainActivity extends Activity {
         root.addView(webView, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
         LinearLayout bottom = new LinearLayout(this);
-        bottom.setOrientation(LinearLayout.HORIZONTAL);
-        bottom.setGravity(Gravity.CENTER_VERTICAL);
+        bottom.setOrientation(LinearLayout.VERTICAL);
         bottom.setPadding(pad, pad, pad, pad);
 
+        LinearLayout actions = new LinearLayout(this);
+        actions.setOrientation(LinearLayout.HORIZONTAL);
+        actions.setGravity(Gravity.CENTER_VERTICAL);
+
         captureButton = new Button(this);
-        captureButton.setText("전체 캡처");
-        captureButton.setOnClickListener(v -> startCapture());
-        bottom.addView(captureButton, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(52)));
+        captureButton.setText("화면 캡처");
+        captureButton.setOnClickListener(v -> startVisibleCapture());
+        actions.addView(captureButton, new LinearLayout.LayoutParams(0, dp(52), 1f));
+
+        headlessButton = new Button(this);
+        headlessButton.setText("백그라운드 캡처");
+        headlessButton.setOnClickListener(v -> startHeadlessCapture());
+        actions.addView(headlessButton, new LinearLayout.LayoutParams(0, dp(52), 1.25f));
 
         exportButton = new Button(this);
         exportButton.setText("ZIP 저장");
         exportButton.setEnabled(false);
         exportButton.setOnClickListener(v -> exportPendingZip());
-        bottom.addView(exportButton, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dp(52)));
+        actions.addView(exportButton, new LinearLayout.LayoutParams(0, dp(52), 1f));
+        bottom.addView(actions, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         status = new TextView(this);
-        status.setText("ChatGPT에 로그인한 뒤 문제가 발생한 화면에서 ‘전체 캡처’를 누르세요.");
-        status.setPadding(dp(8), 0, dp(4), 0);
-        status.setMaxLines(3);
-        bottom.addView(status, new LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+        status.setText("로그인 후 화면 캡처 또는 자동화 앱과 같은 1440×900 / 160 dpi 백그라운드 캡처를 실행하세요.");
+        status.setPadding(dp(8), dp(4), dp(4), 0);
+        status.setMaxLines(4);
+        bottom.addView(status, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         root.addView(bottom, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         setContentView(root);
-    }
-
-    private void configureWebView() {
-        WebView.setWebContentsDebuggingEnabled(BuildConfig.WEB_CONTENT_DEBUGGING);
-        WebSettings settings = webView.getSettings();
-        settings.setJavaScriptEnabled(true);
-        settings.setDomStorageEnabled(true);
-        settings.setDatabaseEnabled(true);
-        settings.setAllowFileAccess(false);
-        settings.setAllowContentAccess(false);
-        settings.setAllowFileAccessFromFileURLs(false);
-        settings.setAllowUniversalAccessFromFileURLs(false);
-        settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
-        settings.setJavaScriptCanOpenWindowsAutomatically(false);
-        settings.setSupportMultipleWindows(false);
-        settings.setMediaPlaybackRequiresUserGesture(true);
-        settings.setSaveFormData(false);
-        settings.setBuiltInZoomControls(true);
-        settings.setDisplayZoomControls(false);
-
-        CookieManager cookieManager = CookieManager.getInstance();
-        cookieManager.setAcceptCookie(true);
-        cookieManager.setAcceptThirdPartyCookies(webView, true);
-
-        webView.setWebViewClient(new CaptureWebViewClient(this, trafficRecorder));
-        webView.setWebChromeClient(new CaptureWebChromeClient(trafficRecorder));
-    }
-
-    private boolean installDocumentStartHook() {
-        if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) return false;
-        try {
-            String hook = readAsset("hook.js");
-            Set<String> origins = new LinkedHashSet<>();
-            origins.add("https://chatgpt.com");
-            origins.add("https://*.chatgpt.com");
-            hookScriptHandler = WebViewCompat.addDocumentStartJavaScript(webView, hook, origins);
-            return hookScriptHandler != null;
-        } catch (Exception e) {
-            trafficRecorder.recordPage("documentStartHookFailed:" + SafeRedactor.scrubText(e.toString()), webView.getUrl());
-            return false;
-        }
     }
 
     private void navigate(String raw) {
@@ -166,36 +130,77 @@ public final class MainActivity extends Activity {
         }
     }
 
-    private void startCapture() {
+    private String currentCaptureUrl() {
         String current = webView.getUrl();
         Uri uri = current == null ? null : Uri.parse(current);
-        if (uri == null || !CaptureWebViewClient.isCaptureHost(uri.getHost())) {
+        if (uri == null || !CaptureWebViewClient.isCaptureHost(uri.getHost())) return null;
+        return current;
+    }
+
+    private void startVisibleCapture() {
+        String current = currentCaptureUrl();
+        if (current == null) {
             status.setText("캡처는 chatgpt.com 화면에서만 실행됩니다.");
             return;
         }
-        if (pendingZip != null) {
-            CapturePackage.deleteRecursively(pendingZip);
-            pendingZip = null;
-            exportButton.setEnabled(false);
-        }
-        captureButton.setEnabled(false);
-        status.setText("캡처 중: 화면 · DOM · Shadow DOM · frame · CSSOM · 성능 · 네트워크 · 콘솔 · 접근성 · 환경…");
+        clearPendingZip();
+        setCaptureButtonsEnabled(false);
+        status.setText("화면 WebView 전방위 캡처 중…");
         diagnosticRecorder.capture(new DiagnosticRecorder.Callback() {
+            @Override public void onSuccess(File zip) { finishCapture(zip, "화면 캡처 완료"); }
+            @Override public void onFailure(String message) { failCapture(message); }
+        });
+    }
+
+    private void startHeadlessCapture() {
+        String current = currentCaptureUrl();
+        if (current == null) {
+            status.setText("백그라운드 캡처는 chatgpt.com 화면에서만 실행됩니다.");
+            return;
+        }
+        clearPendingZip();
+        setCaptureButtonsEnabled(false);
+        status.setText("자동화 앱과 같은 VirtualDisplay WebView를 생성해 현재 URL을 재로딩하고 전방위 캡처 중…");
+        headlessCaptureController = new HeadlessCaptureController(this, current, new HeadlessCaptureController.Callback() {
             @Override
             public void onSuccess(File zip) {
-                pendingZip = zip;
-                captureButton.setEnabled(true);
-                exportButton.setEnabled(true);
-                status.setText("캡처 완료: " + zip.getName() + " (" + zip.length() + " bytes)");
-                exportPendingZip();
+                headlessCaptureController = null;
+                finishCapture(zip, "백그라운드 캡처 완료");
             }
 
             @Override
             public void onFailure(String message) {
-                captureButton.setEnabled(true);
-                status.setText("캡처 실패: " + SafeRedactor.scrubText(message));
+                headlessCaptureController = null;
+                failCapture(message);
             }
         });
+        headlessCaptureController.start();
+    }
+
+    private void finishCapture(File zip, String prefix) {
+        pendingZip = zip;
+        setCaptureButtonsEnabled(true);
+        exportButton.setEnabled(true);
+        status.setText(prefix + ": " + zip.getName() + " (" + zip.length() + " bytes)");
+        exportPendingZip();
+    }
+
+    private void failCapture(String message) {
+        setCaptureButtonsEnabled(true);
+        status.setText("캡처 실패: " + SafeRedactor.scrubText(message));
+    }
+
+    private void setCaptureButtonsEnabled(boolean enabled) {
+        captureButton.setEnabled(enabled);
+        headlessButton.setEnabled(enabled);
+    }
+
+    private void clearPendingZip() {
+        if (pendingZip != null) {
+            CapturePackage.deleteRecursively(pendingZip);
+            pendingZip = null;
+        }
+        exportButton.setEnabled(false);
     }
 
     private void exportPendingZip() {
@@ -248,15 +253,6 @@ public final class MainActivity extends Activity {
         }, "capture-export").start();
     }
 
-    String readAsset(String name) throws Exception {
-        try (InputStream in = getAssets().open(name); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
-            byte[] buffer = new byte[32 * 1024];
-            int read;
-            while ((read = in.read(buffer)) != -1) out.write(buffer, 0, read);
-            return new String(out.toByteArray(), StandardCharsets.UTF_8);
-        }
-    }
-
     @Override
     public void onBackPressed() {
         if (webView != null && webView.canGoBack()) webView.goBack();
@@ -265,6 +261,14 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
+        if (headlessCaptureController != null) {
+            headlessCaptureController.cancel();
+            headlessCaptureController = null;
+        }
+        if (hookScriptHandler != null) {
+            try { hookScriptHandler.remove(); } catch (Exception ignored) {}
+            hookScriptHandler = null;
+        }
         if (webView != null) {
             webView.stopLoading();
             webView.destroy();

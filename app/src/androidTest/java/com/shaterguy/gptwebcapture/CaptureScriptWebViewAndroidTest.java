@@ -42,15 +42,15 @@ public class CaptureScriptWebViewAndroidTest {
 
     @SuppressLint("SetJavaScriptEnabled")
     @Test
-    public void captureRuntimeCollectsProjectComposerAndRedactsSecrets() throws Exception {
+    public void productionVirtualDisplayHostRunsCaptureAndRedactsSecrets() throws Exception {
         Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
-        AtomicReference<TestWebViewHost> hostRef = new AtomicReference<>();
+        AtomicReference<HeadlessWebViewHost> hostRef = new AtomicReference<>();
         CountDownLatch pageLoaded = new CountDownLatch(1);
         TestBridge bridge = new TestBridge();
         boolean documentStartSupported = WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT);
 
         InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
-            TestWebViewHost host = TestWebViewHost.create(context);
+            HeadlessWebViewHost host = HeadlessWebViewHost.create(context);
             hostRef.set(host);
             WebView web = host.webView();
             web.getSettings().setJavaScriptEnabled(true);
@@ -62,13 +62,24 @@ public class CaptureScriptWebViewAndroidTest {
             try {
                 if (documentStartSupported) {
                     String hook = readAsset(context, "hook.js");
-                    WebViewCompat.addDocumentStartJavaScript(web, hook, Collections.singleton(BASE_URL.substring(0, BASE_URL.length() - 1)));
+                    WebViewCompat.addDocumentStartJavaScript(
+                            web,
+                            hook,
+                            Collections.singleton(BASE_URL.substring(0, BASE_URL.length() - 1)));
                 }
             } catch (Exception e) {
                 throw new RuntimeException(e);
             }
             web.loadDataWithBaseURL(BASE_URL, HTML, "text/html", "UTF-8", null);
         });
+
+        HeadlessWebViewHost host = hostRef.get();
+        assertNotNull(host);
+        assertTrue("production capture host fell back instead of creating a VirtualDisplay", host.isVirtualDisplay());
+        assertTrue("production VirtualDisplay WebView is not attached", host.isWindowAttached());
+        assertEquals(1440, HeadlessWebViewHost.WIDTH);
+        assertEquals(900, HeadlessWebViewHost.HEIGHT);
+        assertEquals(160, HeadlessWebViewHost.DENSITY_DPI);
 
         assertTrue("fixture page did not load", pageLoaded.await(20, TimeUnit.SECONDS));
         String captureJs = readAsset(context, "capture.js");
@@ -109,8 +120,8 @@ public class CaptureScriptWebViewAndroidTest {
         if (documentStartSupported) assertTrue("closed shadow root was not retained", hasClosed);
 
         InstrumentationRegistry.getInstrumentation().runOnMainSync(() -> {
-            TestWebViewHost host = hostRef.get();
-            if (host != null) host.destroy();
+            HeadlessWebViewHost current = hostRef.get();
+            if (current != null) current.destroy();
         });
     }
 

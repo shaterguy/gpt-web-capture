@@ -1,6 +1,5 @@
 package com.shaterguy.gptwebcapture;
 
-import android.app.Activity;
 import android.content.Context;
 import android.content.pm.PackageInfo;
 import android.graphics.Bitmap;
@@ -55,13 +54,24 @@ final class DiagnosticRecorder {
     private final WebView webView;
     private final TrafficRecorder traffic;
     private final boolean documentStartHookInstalled;
+    private final String captureMode;
+    private final View captureRoot;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
 
-    DiagnosticRecorder(MainActivity activity, WebView webView, TrafficRecorder traffic, boolean documentStartHookInstalled) {
+    DiagnosticRecorder(MainActivity activity, WebView webView, TrafficRecorder traffic,
+                       boolean documentStartHookInstalled) {
+        this(activity, webView, traffic, documentStartHookInstalled,
+                "visible-activity-webview", activity.getWindow().getDecorView());
+    }
+
+    DiagnosticRecorder(MainActivity activity, WebView webView, TrafficRecorder traffic,
+                       boolean documentStartHookInstalled, String captureMode, View captureRoot) {
         this.activity = activity;
         this.webView = webView;
         this.traffic = traffic;
         this.documentStartHookInstalled = documentStartHookInstalled;
+        this.captureMode = captureMode == null || captureMode.isEmpty() ? "unknown" : captureMode;
+        this.captureRoot = captureRoot == null ? webView : captureRoot;
     }
 
     void capture(Callback callback) {
@@ -94,7 +104,7 @@ final class DiagnosticRecorder {
         });
         attempt(pack, "accessibility/android-tree.json", () -> pack.writeJson("accessibility/android-tree.json", accessibilitySnapshot()));
         attempt(pack, "screenshots/webview-viewport.png", () -> captureViewBitmap(pack, "screenshots/webview-viewport.png", webView));
-        attempt(pack, "screenshots/app-window.png", () -> captureViewBitmap(pack, "screenshots/app-window.png", activity.getWindow().getDecorView()));
+        attempt(pack, "screenshots/context-root.png", () -> captureViewBitmap(pack, "screenshots/context-root.png", captureRoot));
         attempt(pack, "screenshots/webview-full-best-effort.png", () -> captureFullPicture(pack));
         attempt(pack, "limitations.json", () -> pack.writeJson("limitations.json", limitations()));
     }
@@ -120,7 +130,7 @@ final class DiagnosticRecorder {
         try {
             webView.removeJavascriptInterface(BRIDGE_NAME);
             webView.addJavascriptInterface(bridge, BRIDGE_NAME);
-            String source = activity.readAsset("capture.js");
+            String source = WebViewProfile.readAsset(activity, "capture.js");
             webView.evaluateJavascript(source + "\n;typeof window.__GPT_WEB_CAPTURE__;", result -> {
                 String run = "(() => { try {" +
                         "if(!window.__GPT_WEB_CAPTURE__) { window." + BRIDGE_NAME + ".fail(" + JSONObject.quote(token) + ",'capture runtime missing'); return 'missing'; }" +
@@ -138,6 +148,8 @@ final class DiagnosticRecorder {
 
     private JSONObject nativeEnvironment() throws Exception {
         JSONObject root = new JSONObject();
+        root.put("captureMode", captureMode);
+
         JSONObject app = new JSONObject();
         app.put("applicationId", BuildConfig.APPLICATION_ID);
         app.put("versionName", BuildConfig.VERSION_NAME);
@@ -180,6 +192,7 @@ final class DiagnosticRecorder {
         webViewInfo.put("scrollX", webView.getScrollX());
         webViewInfo.put("scrollY", webView.getScrollY());
         webViewInfo.put("shown", webView.isShown());
+        webViewInfo.put("attachedToWindow", webView.isAttachedToWindow());
         webViewInfo.put("focused", webView.isFocused());
         webViewInfo.put("windowFocused", webView.hasWindowFocus());
         webViewInfo.put("visibility", webView.getVisibility());
@@ -201,16 +214,8 @@ final class DiagnosticRecorder {
         webSettings.put("safeBrowsingEnabled", settings.getSafeBrowsingEnabled());
         root.put("webSettings", webSettings);
 
-        DisplayMetrics metrics = activity.getResources().getDisplayMetrics();
-        JSONObject display = new JSONObject();
-        display.put("widthPixels", metrics.widthPixels);
-        display.put("heightPixels", metrics.heightPixels);
-        display.put("density", metrics.density);
-        display.put("densityDpi", metrics.densityDpi);
-        display.put("scaledDensity", metrics.scaledDensity);
-        display.put("xdpi", metrics.xdpi);
-        display.put("ydpi", metrics.ydpi);
-        root.put("display", display);
+        root.put("activityDisplay", displayMetrics(activity.getResources().getDisplayMetrics()));
+        root.put("webViewDisplay", displayMetrics(webView.getResources().getDisplayMetrics()));
 
         JSONObject runtime = new JSONObject();
         Runtime jvm = Runtime.getRuntime();
@@ -227,6 +232,18 @@ final class DiagnosticRecorder {
         root.put("network", networkEnvironment());
         root.put("certificate", certificateEnvironment());
         return root;
+    }
+
+    private JSONObject displayMetrics(DisplayMetrics metrics) throws Exception {
+        JSONObject display = new JSONObject();
+        display.put("widthPixels", metrics.widthPixels);
+        display.put("heightPixels", metrics.heightPixels);
+        display.put("density", metrics.density);
+        display.put("densityDpi", metrics.densityDpi);
+        display.put("scaledDensity", metrics.scaledDensity);
+        display.put("xdpi", metrics.xdpi);
+        display.put("ydpi", metrics.ydpi);
+        return display;
     }
 
     private JSONObject networkEnvironment() throws Exception {
@@ -408,8 +425,8 @@ final class DiagnosticRecorder {
                 ? "Closed roots created after the document-start hook are retained for capture. Roots created before an unavailable hook cannot be recovered."
                 : "Document-start script support is unavailable, so closed shadow roots cannot be recovered after creation.");
         out.put("browserProtocol", "The app does not attach Chrome DevTools Protocol internally; CDP-only traces and the Chromium AX protocol tree are unavailable.");
-        out.put("secretValues", "Authentication secrets are intentionally represented only as metadata/hash and are not persisted in plaintext.");
-        out.put("fullPageScreenshot", "WebView.capturePicture is best-effort and pixel-capped to avoid process OOM; viewport and app-window screenshots are captured separately.");
+        out.put("secretValues", "Structured diagnostic outputs redact authentication secrets; raw MHT is a private page archive and may contain rendered application source/state, so the ZIP must be treated as sensitive diagnostic data.");
+        out.put("fullPageScreenshot", "WebView.capturePicture is best-effort and pixel-capped to avoid process OOM; viewport and capture-context root screenshots are recorded separately.");
         return out;
     }
 
@@ -468,6 +485,7 @@ final class DiagnosticRecorder {
                     JSONObject summary = new JSONObject();
                     summary.put("url", SafeRedactor.redactUrl(sourceUrl));
                     summary.put("title", SafeRedactor.scrubText(webView.getTitle()));
+                    summary.put("captureMode", captureMode);
                     summary.put("documentStartHookInstalled", documentStartHookInstalled);
                     summary.put("javascriptCompleted", jsComplete.get());
                     summary.put("webArchiveCompleted", archiveComplete.get());

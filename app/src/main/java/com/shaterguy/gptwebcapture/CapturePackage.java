@@ -127,7 +127,7 @@ final class CapturePackage {
             manifest.put("failures", failures);
             manifest.put("manifestExcludedFromOwnChecksum", true);
             manifest.put("captureSummary", captureSummary == null ? new JSONObject() : captureSummary);
-            manifest.put("redactionPolicy", "Authentication secrets, cookie values, authorization headers, password/hidden form values, storage values, nonces and inline script bodies are not persisted in plaintext.");
+            manifest.put("redactionPolicy", "Structured JSON/HTML/network/console outputs redact authentication secrets, cookie values, authorization headers, password/hidden form values, storage values, nonces and inline script bodies. page/webarchive.mht is a raw private WebView archive and does not receive the same structural redaction guarantee; treat the entire ZIP as sensitive diagnostic data.");
         } catch (Exception ignored) {}
         writeJson("manifest.json", manifest);
 

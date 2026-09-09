@@ -13,6 +13,8 @@ import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
+import androidx.webkit.ScriptHandler;
+
 import java.io.File;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -25,11 +27,10 @@ public final class MainActivity extends Activity {
     private EditText address;
     private TextView status;
     private Button captureButton;
-    private Button headlessButton;
     private Button exportButton;
     private TrafficRecorder trafficRecorder;
     private DiagnosticRecorder diagnosticRecorder;
-    private HeadlessCaptureController headlessCaptureController;
+    private ScriptHandler passiveHookHandler;
     private File pendingZip;
 
     @Override
@@ -39,16 +40,14 @@ public final class MainActivity extends Activity {
         buildUi();
         WebView.setWebContentsDebuggingEnabled(BuildConfig.WEB_CONTENT_DEBUGGING);
 
-        // The visible browser must stay behaviorally pristine. Persistent document-start hooks,
-        // prototype monkey patches and mutation/event observers are intentionally NOT installed
-        // here. They belong only to the isolated automation-style capture WebView.
-        WebViewProfile.configure(this, webView, trafficRecorder, null);
+        WebViewProfile.configure(this, webView, trafficRecorder, (view, url) -> address.setText(url == null ? "" : url));
+        passiveHookHandler = WebViewProfile.installDocumentStartHook(this, webView, trafficRecorder);
         diagnosticRecorder = new DiagnosticRecorder(
                 this,
                 webView,
                 trafficRecorder,
-                false,
-                "visible-pristine-activity-webview",
+                passiveHookHandler != null,
+                "single-user-operated-webview",
                 getWindow().getDecorView());
         webView.loadUrl(HOME_URL);
     }
@@ -97,14 +96,9 @@ public final class MainActivity extends Activity {
         actions.setGravity(Gravity.CENTER_VERTICAL);
 
         captureButton = new Button(this);
-        captureButton.setText("화면 캡처");
-        captureButton.setOnClickListener(v -> startVisibleCapture());
+        captureButton.setText("전체 캡처");
+        captureButton.setOnClickListener(v -> startCapture());
         actions.addView(captureButton, new LinearLayout.LayoutParams(0, dp(52), 1f));
-
-        headlessButton = new Button(this);
-        headlessButton.setText("백그라운드 캡처");
-        headlessButton.setOnClickListener(v -> startHeadlessCapture());
-        actions.addView(headlessButton, new LinearLayout.LayoutParams(0, dp(52), 1.25f));
 
         exportButton = new Button(this);
         exportButton.setText("ZIP 저장");
@@ -114,7 +108,7 @@ public final class MainActivity extends Activity {
         bottom.addView(actions, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         status = new TextView(this);
-        status.setText("위 WebView는 무개입 브라우저입니다. 화면 캡처는 현재 상태를 일회성 스냅샷으로 읽고, 백그라운드 캡처만 별도 계측 WebView를 사용합니다.");
+        status.setText("이 WebView 하나를 직접 조작하세요. 앱은 같은 WebView를 계속 관찰하고, ‘전체 캡처’를 누르면 현재 상태와 누적 진단 기록을 ZIP으로 저장합니다.");
         status.setPadding(dp(8), dp(4), dp(4), 0);
         status.setMaxLines(4);
         bottom.addView(status, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
@@ -127,8 +121,9 @@ public final class MainActivity extends Activity {
         if (value.isEmpty()) value = HOME_URL;
         try {
             Uri uri = Uri.parse(value);
-            if (!"https".equalsIgnoreCase(uri.getScheme()) || !CaptureWebViewClient.isAllowedWebViewHost(uri.getHost())) {
-                status.setText("주소창 직접 이동은 chatgpt.com / openai.com HTTPS 주소만 허용됩니다.");
+            String scheme = uri.getScheme();
+            if (!"https".equalsIgnoreCase(scheme) && !"http".equalsIgnoreCase(scheme)) {
+                status.setText("http/https 주소만 직접 입력할 수 있습니다.");
                 return;
             }
             address.setText(value);
@@ -138,69 +133,32 @@ public final class MainActivity extends Activity {
         }
     }
 
-    private String currentCaptureUrl() {
+    private void startCapture() {
         String current = webView.getUrl();
-        Uri uri = current == null ? null : Uri.parse(current);
-        if (uri == null || !CaptureWebViewClient.isCaptureHost(uri.getHost())) return null;
-        return current;
-    }
-
-    private void startVisibleCapture() {
-        String current = currentCaptureUrl();
-        if (current == null) {
-            status.setText("캡처는 chatgpt.com 화면에서만 실행됩니다.");
+        if (current == null || current.isEmpty()) {
+            status.setText("캡처할 페이지가 없습니다.");
             return;
         }
         clearPendingZip();
-        setCaptureButtonsEnabled(false);
-        status.setText("현재 visible WebView를 변경하지 않고 일회성 전방위 스냅샷을 수집 중…");
+        captureButton.setEnabled(false);
+        status.setText("현재 WebView + 누적 DOM/이벤트/네트워크/콘솔/환경을 전방위 캡처 중…");
         diagnosticRecorder.capture(new DiagnosticRecorder.Callback() {
-            @Override public void onSuccess(File zip) { finishCapture(zip, "화면 캡처 완료"); }
+            @Override public void onSuccess(File zip) { finishCapture(zip); }
             @Override public void onFailure(String message) { failCapture(message); }
         });
     }
 
-    private void startHeadlessCapture() {
-        String current = currentCaptureUrl();
-        if (current == null) {
-            status.setText("백그라운드 캡처는 chatgpt.com 화면에서만 실행됩니다.");
-            return;
-        }
-        clearPendingZip();
-        setCaptureButtonsEnabled(false);
-        status.setText("자동화 앱과 같은 VirtualDisplay 계측 WebView를 생성해 현재 URL을 재로딩하고 전방위 캡처 중…");
-        headlessCaptureController = new HeadlessCaptureController(this, current, new HeadlessCaptureController.Callback() {
-            @Override
-            public void onSuccess(File zip) {
-                headlessCaptureController = null;
-                finishCapture(zip, "백그라운드 캡처 완료");
-            }
-
-            @Override
-            public void onFailure(String message) {
-                headlessCaptureController = null;
-                failCapture(message);
-            }
-        });
-        headlessCaptureController.start();
-    }
-
-    private void finishCapture(File zip, String prefix) {
+    private void finishCapture(File zip) {
         pendingZip = zip;
-        setCaptureButtonsEnabled(true);
+        captureButton.setEnabled(true);
         exportButton.setEnabled(true);
-        status.setText(prefix + ": " + zip.getName() + " (" + zip.length() + " bytes)");
+        status.setText("캡처 완료: " + zip.getName() + " (" + zip.length() + " bytes)");
         exportPendingZip();
     }
 
     private void failCapture(String message) {
-        setCaptureButtonsEnabled(true);
+        captureButton.setEnabled(true);
         status.setText("캡처 실패: " + SafeRedactor.scrubText(message));
-    }
-
-    private void setCaptureButtonsEnabled(boolean enabled) {
-        captureButton.setEnabled(enabled);
-        headlessButton.setEnabled(enabled);
     }
 
     private void clearPendingZip() {
@@ -269,11 +227,12 @@ public final class MainActivity extends Activity {
 
     @Override
     protected void onDestroy() {
-        if (headlessCaptureController != null) {
-            headlessCaptureController.cancel();
-            headlessCaptureController = null;
+        if (passiveHookHandler != null) {
+            try { passiveHookHandler.remove(); } catch (Exception ignored) {}
+            passiveHookHandler = null;
         }
         if (webView != null) {
+            android.webkit.CookieManager.getInstance().flush();
             webView.stopLoading();
             webView.destroy();
         }
@@ -281,9 +240,8 @@ public final class MainActivity extends Activity {
         super.onDestroy();
     }
 
-    WebView webViewForInstrumentationTest() {
-        return webView;
-    }
+    WebView webViewForInstrumentationTest() { return webView; }
+    boolean passiveHookInstalledForInstrumentationTest() { return passiveHookHandler != null; }
 
     private int dp(int value) {
         return Math.round(value * getResources().getDisplayMetrics().density);

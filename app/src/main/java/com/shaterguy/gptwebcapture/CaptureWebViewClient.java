@@ -1,7 +1,6 @@
 package com.shaterguy.gptwebcapture;
 
 import android.app.Activity;
-import android.content.Intent;
 import android.net.Uri;
 import android.net.http.SslError;
 import android.webkit.SslErrorHandler;
@@ -35,27 +34,23 @@ class CaptureWebViewClient extends WebViewClient {
     static boolean isCaptureHost(String host) {
         if (host == null) return false;
         String value = host.toLowerCase(Locale.ROOT);
-        return value.equals("chatgpt.com") || value.endsWith(".chatgpt.com");
+        return value.equals("chatgpt.com") || value.endsWith(".chatgpt.com")
+                || value.equals("openai.com") || value.endsWith(".openai.com");
     }
 
     static boolean isAllowedWebViewHost(String host) {
-        if (host == null) return false;
-        String value = host.toLowerCase(Locale.ROOT);
-        return isCaptureHost(value) || value.equals("openai.com") || value.endsWith(".openai.com");
+        return host != null;
     }
 
     @Override
     public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
-        if (request == null || !request.isForMainFrame()) return false;
-        Uri uri = request.getUrl();
-        if (uri == null) return true;
-        String scheme = uri.getScheme();
-        if (!"https".equalsIgnoreCase(scheme)) return true;
-        if (isAllowedWebViewHost(uri.getHost())) return false;
-        try {
-            activity.startActivity(new Intent(Intent.ACTION_VIEW, uri));
-        } catch (Exception ignored) {}
-        return true;
+        // Match the proven SelfRun login browser: never hijack normal navigation.
+        if (request != null && request.isForMainFrame()) {
+            Uri uri = request.getUrl();
+            recorder.recordPage("navigation:" + (uri == null ? "" : uri.getScheme()),
+                    uri == null ? "" : uri.toString());
+        }
+        return false;
     }
 
     @Override

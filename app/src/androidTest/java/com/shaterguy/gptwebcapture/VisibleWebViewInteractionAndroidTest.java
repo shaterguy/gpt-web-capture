@@ -1,10 +1,12 @@
 package com.shaterguy.gptwebcapture;
 
 import android.content.Context;
+import android.net.Uri;
 import android.os.SystemClock;
 import android.view.MotionEvent;
 import android.webkit.JavascriptInterface;
 import android.webkit.ValueCallback;
+import android.webkit.WebResourceRequest;
 import android.webkit.WebView;
 
 import androidx.test.core.app.ActivityScenario;
@@ -19,6 +21,7 @@ import org.junit.runner.RunWith;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
+import java.util.Collections;
 import java.util.Map;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
@@ -45,12 +48,18 @@ public class VisibleWebViewInteractionAndroidTest {
             "</body></html>";
 
     @Test
-    public void sameProductionWebViewRemainsTouchableAndCapturable() throws Exception {
+    public void sameProductionWebViewRemainsTouchableCapturableAndLoginNavigable() throws Exception {
         Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
         try (ActivityScenario<MainActivity> scenario = ActivityScenario.launch(MainActivity.class)) {
             AtomicReference<WebView> webRef = new AtomicReference<>();
             scenario.onActivity(activity -> {
                 assertTrue("passive document-start hook was not installed", activity.passiveHookInstalledForInstrumentationTest());
+                CaptureWebViewClient loginClient = new CaptureWebViewClient(activity, new TrafficRecorder());
+                assertFalse("auth.openai.com navigation was blocked",
+                        loginClient.shouldOverrideUrlLoading(activity.webViewForInstrumentationTest(), request("https://auth.openai.com/authorize")));
+                assertFalse("external HTTPS IdP navigation was blocked",
+                        loginClient.shouldOverrideUrlLoading(activity.webViewForInstrumentationTest(), request("https://accounts.google.com/o/oauth2/v2/auth")));
+
                 WebView web = activity.webViewForInstrumentationTest();
                 webRef.set(web);
                 web.loadDataWithBaseURL("https://chatgpt.com/", FIXTURE, "text/html", "UTF-8", null);
@@ -111,6 +120,17 @@ public class VisibleWebViewInteractionAndroidTest {
 
             scenario.onActivity(activity -> activity.webViewForInstrumentationTest().removeJavascriptInterface("GPTCaptureBridge"));
         }
+    }
+
+    private static WebResourceRequest request(String url) {
+        return new WebResourceRequest() {
+            @Override public Uri getUrl() { return Uri.parse(url); }
+            @Override public boolean isForMainFrame() { return true; }
+            @Override public boolean isRedirect() { return false; }
+            @Override public boolean hasGesture() { return true; }
+            @Override public String getMethod() { return "GET"; }
+            @Override public Map<String, String> getRequestHeaders() { return Collections.emptyMap(); }
+        };
     }
 
     private static boolean waitForJs(WebView web, String expression, String expected, long timeoutMs) throws Exception {

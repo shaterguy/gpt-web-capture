@@ -18,22 +18,26 @@ import java.util.Set;
 final class WebViewProfile {
     private WebViewProfile() {}
 
+    /**
+     * Match the simple login-capable WebView profile already proven in SelfRun.
+     * Do not impose navigation/window policies that can interfere with ChatGPT auth/UI behavior.
+     */
     static void configure(Activity activity, WebView webView, TrafficRecorder recorder,
                           CaptureWebViewClient.PageListener pageListener) {
         WebSettings settings = webView.getSettings();
         settings.setJavaScriptEnabled(true);
         settings.setDomStorageEnabled(true);
         settings.setDatabaseEnabled(true);
+        settings.setMediaPlaybackRequiresUserGesture(true);
         settings.setAllowFileAccess(false);
         settings.setAllowContentAccess(false);
         settings.setAllowFileAccessFromFileURLs(false);
         settings.setAllowUniversalAccessFromFileURLs(false);
         settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
-        settings.setJavaScriptCanOpenWindowsAutomatically(false);
-        settings.setSupportMultipleWindows(false);
-        settings.setMediaPlaybackRequiresUserGesture(true);
-        settings.setSaveFormData(false);
-        settings.setBuiltInZoomControls(true);
+        settings.setUseWideViewPort(false);
+        settings.setLoadWithOverviewMode(false);
+        settings.setSupportZoom(false);
+        settings.setBuiltInZoomControls(false);
         settings.setDisplayZoomControls(false);
 
         CookieManager cookieManager = CookieManager.getInstance();
@@ -44,6 +48,7 @@ final class WebViewProfile {
         webView.setWebChromeClient(new CaptureWebChromeClient(recorder));
     }
 
+    /** Installs passive telemetry in the SAME user-operated WebView. */
     static ScriptHandler installDocumentStartHook(Activity activity, WebView webView, TrafficRecorder recorder) {
         if (!WebViewFeature.isFeatureSupported(WebViewFeature.DOCUMENT_START_SCRIPT)) return null;
         try {
@@ -51,6 +56,8 @@ final class WebViewProfile {
             Set<String> origins = new LinkedHashSet<>();
             origins.add("https://chatgpt.com");
             origins.add("https://*.chatgpt.com");
+            origins.add("https://auth.openai.com");
+            origins.add("https://*.openai.com");
             return WebViewCompat.addDocumentStartJavaScript(webView, hook, origins);
         } catch (Exception e) {
             if (recorder != null) recorder.recordPage("documentStartHookFailed:" + SafeRedactor.scrubText(e.toString()), webView.getUrl());

@@ -1,17 +1,14 @@
 package com.shaterguy.gptwebcapture;
 
-import android.content.Context;
 import android.net.Uri;
 import android.os.SystemClock;
 import android.view.MotionEvent;
-import android.webkit.JavascriptInterface;
 import android.webkit.ValueCallback;
 import android.webkit.WebResourceRequest;
 import android.webkit.WebView;
 
 import androidx.test.core.app.ActivityScenario;
 import androidx.test.ext.junit.runners.AndroidJUnit4;
-import androidx.test.platform.app.InstrumentationRegistry;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
@@ -19,14 +16,16 @@ import org.junit.Test;
 import org.junit.runner.RunWith;
 
 import java.io.ByteArrayOutputStream;
+import java.io.File;
 import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.util.Collections;
 import java.util.Map;
-import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipFile;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
@@ -49,7 +48,6 @@ public class VisibleWebViewInteractionAndroidTest {
 
     @Test
     public void sameProductionWebViewRemainsTouchableCapturableAndLoginNavigable() throws Exception {
-        Context context = InstrumentationRegistry.getInstrumentation().getTargetContext();
         try (ActivityScenario<MainActivity> scenario = ActivityScenario.launch(MainActivity.class)) {
             AtomicReference<WebView> webRef = new AtomicReference<>();
             scenario.onActivity(activity -> {
@@ -71,6 +69,7 @@ public class VisibleWebViewInteractionAndroidTest {
                     "document.readyState==='complete' && !!document.getElementById('tap')", "true", 10_000));
             assertEquals("true", eval(web, "window.__GPT_WEB_CAPTURE_HOOK__ && window.__GPT_WEB_CAPTURE_HOOK__.passiveOnly===true"));
             assertEquals("true", eval(web, "window.__GPT_WEB_CAPTURE_HOOK__.attachShadowPatched===false"));
+            assertEquals("true", eval(web, "typeof window.GPTCaptureBridge==='object'"));
 
             scenario.onActivity(activity -> {
                 WebView current = activity.webViewForInstrumentationTest();
@@ -94,31 +93,46 @@ public class VisibleWebViewInteractionAndroidTest {
                     "window.__clicked===true && document.title==='clicked'", "true", 10_000));
             assertEquals("true", eval(web, "window.__GPT_WEB_CAPTURE_HOOK__.events.some(e=>e.type==='pointerdown'||e.type==='click')"));
 
-            TestBridge bridge = new TestBridge();
-            scenario.onActivity(activity -> activity.webViewForInstrumentationTest().addJavascriptInterface(bridge, "GPTCaptureBridge"));
-            String captureJs = readAsset(context, "capture.js");
-            String token = "same-webview-test-token";
-            scenario.onActivity(activity -> {
-                WebView current = activity.webViewForInstrumentationTest();
-                current.evaluateJavascript(captureJs, ignored -> current.evaluateJavascript(
-                        "window.__GPT_WEB_CAPTURE__.run('GPTCaptureBridge'," + JSONObject.quote(token) + ")", ignored2 -> {}));
-            });
+            CountDownLatch captureDone = new CountDownLatch(1);
+            AtomicReference<File> zipRef = new AtomicReference<>();
+            AtomicReference<String> captureFailure = new AtomicReference<>();
+            scenario.onActivity(activity -> activity.captureForInstrumentationTest(new DiagnosticRecorder.Callback() {
+                @Override public void onSuccess(File zip) {
+                    zipRef.set(zip);
+                    captureDone.countDown();
+                }
+                @Override public void onFailure(String message) {
+                    captureFailure.set(message);
+                    captureDone.countDown();
+                }
+            }));
 
-            assertTrue("same-WebView capture runtime did not finish", bridge.finished.await(45, TimeUnit.SECONDS));
-            assertNull("capture runtime failed: " + bridge.failure.get(), bridge.failure.get());
-            assertTrue(bridge.parts.containsKey("dom/sanitized.html"));
-            assertTrue(bridge.parts.containsKey("dom/composer-candidates.json"));
-            assertTrue(bridge.parts.containsKey("timeline/hook-status.json"));
+            assertTrue("production same-WebView capture did not finish", captureDone.await(60, TimeUnit.SECONDS));
+            assertNull("production capture failed: " + captureFailure.get(), captureFailure.get());
+            File zip = zipRef.get();
+            assertNotNull("capture returned no ZIP", zip);
+            assertTrue("capture ZIP missing", zip.isFile() && zip.length() > 0);
 
-            String dom = bridge.parts.get("dom/sanitized.html").toString();
-            assertFalse(dom.contains("password-value-should-never-export"));
-            assertFalse(dom.contains("hidden-token-should-never-export"));
-            JSONObject candidates = new JSONObject(bridge.parts.get("dom/composer-candidates.json").toString());
-            JSONArray roleTextboxes = candidates.getJSONObject("selectors").getJSONArray("[role=\"textbox\"]");
-            assertTrue("composer candidate missing from same WebView", roleTextboxes.length() > 0);
-            assertEquals("project-composer", roleTextboxes.getJSONObject(0).getString("testId"));
+            try (ZipFile captureZip = new ZipFile(zip)) {
+                assertNotNull(captureZip.getEntry("manifest.json"));
+                assertNotNull(captureZip.getEntry("web/dom/sanitized.html"));
+                assertNotNull(captureZip.getEntry("web/dom/composer-candidates.json"));
+                assertNotNull(captureZip.getEntry("web/timeline/hook-status.json"));
+                assertNotNull(captureZip.getEntry("network/events.json"));
+                assertNotNull(captureZip.getEntry("console/events.json"));
 
-            scenario.onActivity(activity -> activity.webViewForInstrumentationTest().removeJavascriptInterface("GPTCaptureBridge"));
+                String dom = readEntry(captureZip, "web/dom/sanitized.html");
+                assertFalse(dom.contains("password-value-should-never-export"));
+                assertFalse(dom.contains("hidden-token-should-never-export"));
+
+                JSONObject candidates = new JSONObject(readEntry(captureZip, "web/dom/composer-candidates.json"));
+                JSONArray roleTextboxes = candidates.getJSONObject("selectors").getJSONArray("[role=\"textbox\"]");
+                assertTrue("composer candidate missing from same WebView ZIP", roleTextboxes.length() > 0);
+                assertEquals("project-composer", roleTextboxes.getJSONObject(0).getString("testId"));
+            } finally {
+                // The test owns this internal capture artifact.
+                zip.delete();
+            }
         }
     }
 
@@ -155,26 +169,14 @@ public class VisibleWebViewInteractionAndroidTest {
         return result.get();
     }
 
-    private static String readAsset(Context context, String name) throws Exception {
-        try (InputStream in = context.getAssets().open(name); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
+    private static String readEntry(ZipFile zip, String name) throws Exception {
+        ZipEntry entry = zip.getEntry(name);
+        assertNotNull("missing ZIP entry: " + name, entry);
+        try (InputStream in = zip.getInputStream(entry); ByteArrayOutputStream out = new ByteArrayOutputStream()) {
             byte[] buffer = new byte[16 * 1024];
             int read;
             while ((read = in.read(buffer)) != -1) out.write(buffer, 0, read);
             return new String(out.toByteArray(), StandardCharsets.UTF_8);
         }
-    }
-
-    public static final class TestBridge {
-        final Map<String, StringBuilder> parts = new ConcurrentHashMap<>();
-        final CountDownLatch finished = new CountDownLatch(1);
-        final AtomicReference<String> failure = new AtomicReference<>();
-
-        @JavascriptInterface
-        public synchronized void push(String token, String path, int sequence, int total, String chunk) {
-            parts.computeIfAbsent(path, ignored -> new StringBuilder()).append(chunk == null ? "" : chunk);
-        }
-
-        @JavascriptInterface public void complete(String token, String summary) { finished.countDown(); }
-        @JavascriptInterface public void fail(String token, String error) { failure.set(error); finished.countDown(); }
     }
 }

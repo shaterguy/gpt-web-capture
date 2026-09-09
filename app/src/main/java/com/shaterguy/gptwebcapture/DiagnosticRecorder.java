@@ -30,9 +30,7 @@ import java.io.File;
 import java.io.IOException;
 import java.time.Instant;
 import java.util.ArrayDeque;
-import java.util.HashMap;
 import java.util.Locale;
-import java.util.Map;
 import java.util.Queue;
 import java.util.TimeZone;
 import java.util.UUID;
@@ -57,6 +55,8 @@ final class DiagnosticRecorder {
     private final String captureMode;
     private final View captureRoot;
     private final Handler mainHandler = new Handler(Looper.getMainLooper());
+    private final PersistentCaptureBridge persistentBridge = new PersistentCaptureBridge();
+    private boolean bridgeInstalled;
 
     DiagnosticRecorder(MainActivity activity, WebView webView, TrafficRecorder traffic,
                        boolean documentStartHookInstalled) {
@@ -74,9 +74,40 @@ final class DiagnosticRecorder {
         this.captureRoot = captureRoot == null ? webView : captureRoot;
     }
 
+    /** Must be called before the first page load so the bridge is available in every current page. */
+    void installPersistentBridge() {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post(this::installPersistentBridge);
+            return;
+        }
+        if (bridgeInstalled) return;
+        webView.addJavascriptInterface(persistentBridge, BRIDGE_NAME);
+        bridgeInstalled = true;
+    }
+
+    void uninstallPersistentBridge() {
+        if (Looper.myLooper() != Looper.getMainLooper()) {
+            mainHandler.post(this::uninstallPersistentBridge);
+            return;
+        }
+        persistentBridge.clear();
+        if (bridgeInstalled) {
+            webView.removeJavascriptInterface(BRIDGE_NAME);
+            bridgeInstalled = false;
+        }
+    }
+
     void capture(Callback callback) {
         if (Looper.myLooper() != Looper.getMainLooper()) {
             mainHandler.post(() -> capture(callback));
+            return;
+        }
+        if (!bridgeInstalled) {
+            callback.onFailure("persistent capture bridge is not installed before page load");
+            return;
+        }
+        if (persistentBridge.isActive()) {
+            callback.onFailure("capture already in progress");
             return;
         }
         String sourceUrl = webView.getUrl();
@@ -126,10 +157,12 @@ final class DiagnosticRecorder {
 
     private void startJavascriptCapture(SessionState state) {
         String token = UUID.randomUUID().toString();
-        CaptureBridge bridge = new CaptureBridge(state, token);
+        if (!persistentBridge.activate(token, state)) {
+            state.pack.recordFailure("web/javascript-capture", "persistent bridge is busy");
+            state.javascriptDone();
+            return;
+        }
         try {
-            webView.removeJavascriptInterface(BRIDGE_NAME);
-            webView.addJavascriptInterface(bridge, BRIDGE_NAME);
             String source = WebViewProfile.readAsset(activity, "capture.js");
             webView.evaluateJavascript(source + "\n;typeof window.__GPT_WEB_CAPTURE__;", result -> {
                 String run = "(() => { try {" +
@@ -141,7 +174,7 @@ final class DiagnosticRecorder {
             });
         } catch (Exception e) {
             state.pack.recordFailure("web/javascript-capture", e.toString());
-            webView.removeJavascriptInterface(BRIDGE_NAME);
+            persistentBridge.cancel(state);
             state.javascriptDone();
         }
     }
@@ -181,6 +214,7 @@ final class DiagnosticRecorder {
             webViewInfo.put("longVersionCode", webViewPackage.getLongVersionCode());
         }
         webViewInfo.put("documentStartHookInstalled", documentStartHookInstalled);
+        webViewInfo.put("persistentCaptureBridgeInstalled", bridgeInstalled);
         webViewInfo.put("url", SafeRedactor.redactUrl(webView.getUrl()));
         webViewInfo.put("originalUrl", SafeRedactor.redactUrl(webView.getOriginalUrl()));
         webViewInfo.put("title", SafeRedactor.scrubText(webView.getTitle()));
@@ -421,9 +455,7 @@ final class DiagnosticRecorder {
         out.put("networkRequestBodies", "WebView interception does not expose request bodies; they are intentionally not replayed or proxied.");
         out.put("networkResponseBodies", "Responses are not replaced/proxied, so raw response bodies are not duplicated into the capture.");
         out.put("crossOriginFrames", "Cross-origin iframe metadata is captured, but same-origin policy prevents DOM content access.");
-        out.put("closedShadowRoots", documentStartHookInstalled
-                ? "Closed roots created after the document-start hook are retained for capture. Roots created before an unavailable hook cannot be recovered."
-                : "Document-start script support is unavailable, so closed shadow roots cannot be recovered after creation.");
+        out.put("closedShadowRoots", "Closed ShadowRoot contents are intentionally not intercepted because this single user-operated WebView uses passive telemetry only; open roots remain capturable.");
         out.put("browserProtocol", "The app does not attach Chrome DevTools Protocol internally; CDP-only traces and the Chromium AX protocol tree are unavailable.");
         out.put("secretValues", "Structured diagnostic outputs redact authentication secrets; raw MHT is a private page archive and may contain rendered application source/state, so the ZIP must be treated as sensitive diagnostic data.");
         out.put("fullPageScreenshot", "WebView.capturePicture is best-effort and pixel-capped to avoid process OOM; viewport and capture-context root screenshots are recorded separately.");
@@ -466,6 +498,7 @@ final class DiagnosticRecorder {
 
         void timeout() {
             if (!jsComplete.get()) {
+                persistentBridge.cancel(this);
                 pack.recordFailure("web/javascript-capture", "capture timeout");
                 javascriptDone();
             }
@@ -479,7 +512,6 @@ final class DiagnosticRecorder {
             if (!finalized.compareAndSet(false, true)) return;
             mainHandler.post(() -> {
                 try {
-                    webView.removeJavascriptInterface(BRIDGE_NAME);
                     pack.writeJson("network/events.json", traffic.networkSnapshot());
                     pack.writeJson("console/events.json", traffic.consoleSnapshot());
                     JSONObject summary = new JSONObject();
@@ -487,6 +519,7 @@ final class DiagnosticRecorder {
                     summary.put("title", SafeRedactor.scrubText(webView.getTitle()));
                     summary.put("captureMode", captureMode);
                     summary.put("documentStartHookInstalled", documentStartHookInstalled);
+                    summary.put("persistentCaptureBridgeInstalled", bridgeInstalled);
                     summary.put("javascriptCompleted", jsComplete.get());
                     summary.put("webArchiveCompleted", archiveComplete.get());
                     new Thread(() -> {
@@ -504,20 +537,44 @@ final class DiagnosticRecorder {
         }
     }
 
-    private final class CaptureBridge {
-        private final SessionState state;
-        private final String token;
-        private final Map<String, Integer> nextSequence = new HashMap<>();
-        private final AtomicBoolean finished = new AtomicBoolean(false);
+    private final class PersistentCaptureBridge {
+        private SessionState activeState;
+        private String activeToken;
+        private final java.util.HashMap<String, Integer> nextSequence = new java.util.HashMap<>();
+        private boolean finished;
 
-        CaptureBridge(SessionState state, String token) {
-            this.state = state;
-            this.token = token;
+        synchronized boolean activate(String token, SessionState state) {
+            if (activeState != null) return false;
+            activeToken = token;
+            activeState = state;
+            nextSequence.clear();
+            finished = false;
+            return true;
+        }
+
+        synchronized boolean isActive() {
+            return activeState != null;
+        }
+
+        synchronized void cancel(SessionState state) {
+            if (activeState == state) clearLocked();
+        }
+
+        synchronized void clear() {
+            clearLocked();
+        }
+
+        private void clearLocked() {
+            activeState = null;
+            activeToken = null;
+            nextSequence.clear();
+            finished = false;
         }
 
         @JavascriptInterface
         public synchronized void push(String suppliedToken, String path, int sequence, int total, String chunk) {
-            if (!token.equals(suppliedToken) || finished.get()) return;
+            SessionState state = activeState;
+            if (state == null || activeToken == null || !activeToken.equals(suppliedToken) || finished) return;
             try {
                 if (total < 1 || sequence < 0 || sequence >= total) throw new IOException("invalid chunk coordinates");
                 int expected = nextSequence.containsKey(path) ? nextSequence.get(path) : 0;
@@ -532,26 +589,32 @@ final class DiagnosticRecorder {
 
         @JavascriptInterface
         public void complete(String suppliedToken, String summaryJson) {
-            if (!token.equals(suppliedToken) || !finished.compareAndSet(false, true)) return;
+            final SessionState state;
+            synchronized (this) {
+                if (activeState == null || activeToken == null || !activeToken.equals(suppliedToken) || finished) return;
+                finished = true;
+                state = activeState;
+            }
             try {
                 state.pack.writeText("web/capture-runtime-summary.json", summaryJson == null ? "{}" : summaryJson);
             } catch (Exception e) {
                 state.pack.recordFailure("web/capture-runtime-summary.json", e.toString());
             }
-            mainHandler.post(() -> {
-                webView.removeJavascriptInterface(BRIDGE_NAME);
-                state.javascriptDone();
-            });
+            synchronized (this) { clearLocked(); }
+            mainHandler.post(state::javascriptDone);
         }
 
         @JavascriptInterface
         public void fail(String suppliedToken, String error) {
-            if (!token.equals(suppliedToken) || !finished.compareAndSet(false, true)) return;
+            final SessionState state;
+            synchronized (this) {
+                if (activeState == null || activeToken == null || !activeToken.equals(suppliedToken) || finished) return;
+                finished = true;
+                state = activeState;
+            }
             state.pack.recordFailure("web/javascript-capture", error);
-            mainHandler.post(() -> {
-                webView.removeJavascriptInterface(BRIDGE_NAME);
-                state.javascriptDone();
-            });
+            synchronized (this) { clearLocked(); }
+            mainHandler.post(state::javascriptDone);
         }
     }
 }

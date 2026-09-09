@@ -13,8 +13,6 @@ import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.TextView;
 
-import androidx.webkit.ScriptHandler;
-
 import java.io.File;
 import java.io.InputStream;
 import java.io.OutputStream;
@@ -33,8 +31,6 @@ public final class MainActivity extends Activity {
     private DiagnosticRecorder diagnosticRecorder;
     private HeadlessCaptureController headlessCaptureController;
     private File pendingZip;
-    private boolean documentStartHookInstalled;
-    private ScriptHandler hookScriptHandler;
 
     @Override
     protected void onCreate(Bundle savedInstanceState) {
@@ -42,10 +38,18 @@ public final class MainActivity extends Activity {
         trafficRecorder = new TrafficRecorder();
         buildUi();
         WebView.setWebContentsDebuggingEnabled(BuildConfig.WEB_CONTENT_DEBUGGING);
+
+        // The visible browser must stay behaviorally pristine. Persistent document-start hooks,
+        // prototype monkey patches and mutation/event observers are intentionally NOT installed
+        // here. They belong only to the isolated automation-style capture WebView.
         WebViewProfile.configure(this, webView, trafficRecorder, null);
-        hookScriptHandler = WebViewProfile.installDocumentStartHook(this, webView, trafficRecorder);
-        documentStartHookInstalled = hookScriptHandler != null;
-        diagnosticRecorder = new DiagnosticRecorder(this, webView, trafficRecorder, documentStartHookInstalled);
+        diagnosticRecorder = new DiagnosticRecorder(
+                this,
+                webView,
+                trafficRecorder,
+                false,
+                "visible-pristine-activity-webview",
+                getWindow().getDecorView());
         webView.loadUrl(HOME_URL);
     }
 
@@ -78,6 +82,10 @@ public final class MainActivity extends Activity {
         root.addView(top, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         webView = new WebView(this);
+        webView.setFocusable(true);
+        webView.setFocusableInTouchMode(true);
+        webView.setClickable(true);
+        webView.setLongClickable(true);
         root.addView(webView, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
 
         LinearLayout bottom = new LinearLayout(this);
@@ -106,7 +114,7 @@ public final class MainActivity extends Activity {
         bottom.addView(actions, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
 
         status = new TextView(this);
-        status.setText("로그인 후 화면 캡처 또는 자동화 앱과 같은 1440×900 / 160 dpi 백그라운드 캡처를 실행하세요.");
+        status.setText("위 WebView는 무개입 브라우저입니다. 화면 캡처는 현재 상태를 일회성 스냅샷으로 읽고, 백그라운드 캡처만 별도 계측 WebView를 사용합니다.");
         status.setPadding(dp(8), dp(4), dp(4), 0);
         status.setMaxLines(4);
         bottom.addView(status, new LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT));
@@ -120,7 +128,7 @@ public final class MainActivity extends Activity {
         try {
             Uri uri = Uri.parse(value);
             if (!"https".equalsIgnoreCase(uri.getScheme()) || !CaptureWebViewClient.isAllowedWebViewHost(uri.getHost())) {
-                status.setText("앱 내 직접 이동은 chatgpt.com / openai.com HTTPS 주소만 허용됩니다.");
+                status.setText("주소창 직접 이동은 chatgpt.com / openai.com HTTPS 주소만 허용됩니다.");
                 return;
             }
             address.setText(value);
@@ -145,7 +153,7 @@ public final class MainActivity extends Activity {
         }
         clearPendingZip();
         setCaptureButtonsEnabled(false);
-        status.setText("화면 WebView 전방위 캡처 중…");
+        status.setText("현재 visible WebView를 변경하지 않고 일회성 전방위 스냅샷을 수집 중…");
         diagnosticRecorder.capture(new DiagnosticRecorder.Callback() {
             @Override public void onSuccess(File zip) { finishCapture(zip, "화면 캡처 완료"); }
             @Override public void onFailure(String message) { failCapture(message); }
@@ -160,7 +168,7 @@ public final class MainActivity extends Activity {
         }
         clearPendingZip();
         setCaptureButtonsEnabled(false);
-        status.setText("자동화 앱과 같은 VirtualDisplay WebView를 생성해 현재 URL을 재로딩하고 전방위 캡처 중…");
+        status.setText("자동화 앱과 같은 VirtualDisplay 계측 WebView를 생성해 현재 URL을 재로딩하고 전방위 캡처 중…");
         headlessCaptureController = new HeadlessCaptureController(this, current, new HeadlessCaptureController.Callback() {
             @Override
             public void onSuccess(File zip) {
@@ -265,16 +273,16 @@ public final class MainActivity extends Activity {
             headlessCaptureController.cancel();
             headlessCaptureController = null;
         }
-        if (hookScriptHandler != null) {
-            try { hookScriptHandler.remove(); } catch (Exception ignored) {}
-            hookScriptHandler = null;
-        }
         if (webView != null) {
             webView.stopLoading();
             webView.destroy();
         }
         if (pendingZip != null) CapturePackage.deleteRecursively(pendingZip);
         super.onDestroy();
+    }
+
+    WebView webViewForInstrumentationTest() {
+        return webView;
     }
 
     private int dp(int value) {

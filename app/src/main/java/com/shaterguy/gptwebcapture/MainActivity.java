@@ -49,6 +49,10 @@ public final class MainActivity extends Activity {
                 passiveHookHandler != null,
                 "single-user-operated-webview",
                 getWindow().getDecorView());
+        // addJavascriptInterface must exist before the page is loaded. The same persistent bridge
+        // is reused for every later capture; the WebView itself is never replaced or reloaded just
+        // to capture diagnostics.
+        diagnosticRecorder.installPersistentBridge();
         webView.loadUrl(HOME_URL);
     }
 
@@ -231,6 +235,7 @@ public final class MainActivity extends Activity {
             try { passiveHookHandler.remove(); } catch (Exception ignored) {}
             passiveHookHandler = null;
         }
+        if (diagnosticRecorder != null) diagnosticRecorder.uninstallPersistentBridge();
         if (webView != null) {
             android.webkit.CookieManager.getInstance().flush();
             webView.stopLoading();
@@ -242,6 +247,7 @@ public final class MainActivity extends Activity {
 
     WebView webViewForInstrumentationTest() { return webView; }
     boolean passiveHookInstalledForInstrumentationTest() { return passiveHookHandler != null; }
+    void captureForInstrumentationTest(DiagnosticRecorder.Callback callback) { diagnosticRecorder.capture(callback); }
 
     private int dp(int value) {
         return Math.round(value * getResources().getDisplayMetrics().density);

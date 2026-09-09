@@ -13,11 +13,11 @@ permissions:
 
 env:
   DEV_PACKAGE: com.shaterguy.gptwebcapture.dev
-  DEV_VERSION_CODE: '1000001'
-  DEV_VERSION_NAME: 0.1.0-dev1
+  DEV_VERSION_CODE: '1000002'
+  DEV_VERSION_NAME: 0.1.0-dev2
   DEV_APP_LABEL: GPT Web Capture DEV
-  DEV_DEBUG_NAME: gpt-web-capture-dev-v0.1.0-dev1-debug.apk
-  DEV_UNSIGNED_NAME: gpt-web-capture-dev-v0.1.0-dev1-unsigned.apk
+  DEV_DEBUG_NAME: gpt-web-capture-dev-v0.1.0-dev2-debug.apk
+  DEV_UNSIGNED_NAME: gpt-web-capture-dev-v0.1.0-dev2-unsigned.apk
 
 concurrency:
   group: gpt-web-capture-dev-${{ github.ref }}
@@ -85,7 +85,7 @@ jobs:
           test -c /dev/kvm
           sudo chmod 0666 /dev/kvm
 
-      - name: Run WebView capture runtime regression
+      - name: Run WebView capture and real-touch interaction regression
         uses: ReactiveCircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d
         with:
           api-level: 36

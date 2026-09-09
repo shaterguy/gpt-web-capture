@@ -5,7 +5,7 @@
   const MAX_EVENTS = 30000;
   const MAX_PERFORMANCE = 15000;
   const hook = {
-    version: 2,
+    version: 3,
     startedAt: Date.now(),
     events: [],
     performance: [],
@@ -15,7 +15,8 @@
     attachShadowPatched: false,
     mutationObserverInstalled: false,
     performanceObserverTypes: [],
-    reportingObserverInstalled: false
+    reportingObserverInstalled: false,
+    passiveOnly: true
   };
 
   const scrub = value => String(value ?? '')
@@ -37,9 +38,7 @@
         contentEditable: target.getAttribute('contenteditable') || '',
         ariaLabel: scrub(target.getAttribute('aria-label') || '').slice(0, 1000)
       };
-    } catch (_) {
-      return null;
-    }
+    } catch (_) { return null; }
   };
 
   const nodeInfo = node => {
@@ -51,7 +50,12 @@
   };
 
   const record = (type, data = {}) => {
-    const event = { at: Date.now(), perfNow: typeof performance !== 'undefined' ? performance.now() : null, type, ...data };
+    const event = {
+      at: Date.now(),
+      perfNow: typeof performance !== 'undefined' ? performance.now() : null,
+      type,
+      ...data
+    };
     if (hook.events.length < MAX_EVENTS) hook.events.push(event);
     else hook.droppedEvents++;
   };
@@ -63,22 +67,7 @@
     writable: false
   });
 
-  try {
-    const originalAttachShadow = Element.prototype.attachShadow;
-    Element.prototype.attachShadow = function(init) {
-      const root = originalAttachShadow.call(this, init);
-      try {
-        const mode = init && init.mode ? String(init.mode) : '';
-        if (mode === 'closed') hook.closedRoots.push({ host: this, root, createdAt: Date.now() });
-        record('attachShadow', { mode, host: targetInfo(this) });
-      } catch (_) {}
-      return root;
-    };
-    hook.attachShadowPatched = true;
-  } catch (error) {
-    record('hookError', { stage: 'attachShadow', message: scrub(error && (error.stack || error.message || error)) });
-  }
-
+  // Passive DOM observation only. No native/prototype APIs are replaced.
   try {
     const observer = new MutationObserver(records => {
       let added = 0, removed = 0, attributes = 0, characterData = 0;
@@ -106,172 +95,127 @@
           if (samples.length < 24) {
             let currentLength = -1;
             try { currentLength = String(item.target.getAttribute(item.attributeName) || '').length; } catch (_) {}
-            samples.push({
-              type:'attributes',
-              target:nodeInfo(item.target),
-              attributeName:item.attributeName || '',
-              oldValueLength:item.oldValue == null ? -1 : String(item.oldValue).length,
-              newValueLength:currentLength
-            });
+            samples.push({ type:'attributes',target:nodeInfo(item.target),attributeName:item.attributeName || '',newValueLength:currentLength });
           }
         } else if (item.type === 'characterData') {
           characterData++;
-          if (samples.length < 24) {
-            samples.push({
-              type:'characterData',
-              parent:nodeInfo(item.target && item.target.parentElement),
-              oldValueLength:item.oldValue == null ? -1 : String(item.oldValue).length,
-              newValueLength:item.target && item.target.data != null ? String(item.target.data).length : -1
-            });
-          }
+          if (samples.length < 24) samples.push({
+            type:'characterData',
+            parent:nodeInfo(item.target && item.target.parentElement),
+            newValueLength:item.target && item.target.data != null ? String(item.target.data).length : -1
+          });
         }
       }
       record('mutation', {
         records: records.length,
-        added,
-        removed,
-        attributes,
-        characterData,
+        added, removed, attributes, characterData,
         attributeNames: [...attributeNames].slice(0, 100),
         samples
       });
     });
-    observer.observe(document, {
-      subtree: true,
-      childList: true,
-      attributes: true,
-      characterData: true,
-      attributeOldValue: true,
-      characterDataOldValue: true
-    });
+    observer.observe(document, { subtree:true,childList:true,attributes:true,characterData:true });
     hook.mutationObserverInstalled = true;
   } catch (error) {
-    record('hookError', { stage: 'mutationObserver', message: scrub(error && (error.stack || error.message || error)) });
+    record('hookError', { stage:'mutationObserver',message:scrub(error && (error.stack || error.message || error)) });
   }
 
-  const lifecycleTarget = document;
   const simpleEvents = [
     'readystatechange','DOMContentLoaded','load','pageshow','pagehide','visibilitychange',
     'focus','blur','popstate','hashchange','online','offline','freeze','resume','fullscreenchange'
   ];
   for (const type of simpleEvents) {
-    const target = ['readystatechange','visibilitychange','fullscreenchange','freeze','resume'].includes(type) ? lifecycleTarget : window;
-    target.addEventListener(type, event => {
-      record(type, {
-        visibilityState: document.visibilityState,
-        readyState: document.readyState,
-        hasFocus: document.hasFocus(),
-        persisted: !!event.persisted,
-        url: location.href
-      });
-    }, true);
+    const target = ['readystatechange','visibilitychange','fullscreenchange','freeze','resume'].includes(type) ? document : window;
+    target.addEventListener(type, event => record(type, {
+      visibilityState: document.visibilityState,
+      readyState: document.readyState,
+      hasFocus: document.hasFocus(),
+      persisted: !!event.persisted,
+      url: location.href
+    }), { capture:true, passive:true });
   }
 
   for (const type of ['pointerdown','pointerup','click','focusin','focusout','beforeinput','input','change','submit','invalid','selectionchange']) {
     document.addEventListener(type, event => {
-      const data = { target: targetInfo(event.target), trusted: !!event.isTrusted };
+      const data = { target:targetInfo(event.target),trusted:!!event.isTrusted,defaultPrevented:!!event.defaultPrevented };
       if ('inputType' in event) data.inputType = scrub(event.inputType || '');
       if (type === 'selectionchange') {
         try {
           const selection = window.getSelection();
-          data.selection = selection ? { rangeCount:selection.rangeCount,isCollapsed:selection.isCollapsed,anchorOffset:selection.anchorOffset,focusOffset:selection.focusOffset } : null;
+          data.selection = selection ? {
+            rangeCount:selection.rangeCount,
+            isCollapsed:selection.isCollapsed,
+            anchorOffset:selection.anchorOffset,
+            focusOffset:selection.focusOffset
+          } : null;
         } catch (_) {}
       }
       record(type, data);
-    }, true);
+    }, { capture:true, passive:true });
   }
 
   document.addEventListener('formdata', event => {
     const keys = [];
     try { for (const key of event.formData.keys()) keys.push(String(key)); } catch (_) {}
-    record('formdata', { target:targetInfo(event.target), keys:[...new Set(keys)].slice(0, 200), valueBodiesCaptured:false });
-  }, true);
+    record('formdata', { target:targetInfo(event.target),keys:[...new Set(keys)].slice(0,200),valueBodiesCaptured:false });
+  }, { capture:true, passive:true });
 
   document.addEventListener('keydown', event => {
     const key = typeof event.key === 'string' && event.key.length === 1 ? '[printable]' : scrub(event.key || '');
     record('keydown', {
-      target: targetInfo(event.target),
-      key,
-      code: scrub(event.code || ''),
-      altKey: !!event.altKey,
-      ctrlKey: !!event.ctrlKey,
-      metaKey: !!event.metaKey,
-      shiftKey: !!event.shiftKey,
-      repeat: !!event.repeat,
-      composing: !!event.isComposing,
-      trusted: !!event.isTrusted
+      target:targetInfo(event.target),key,code:scrub(event.code || ''),
+      altKey:!!event.altKey,ctrlKey:!!event.ctrlKey,metaKey:!!event.metaKey,shiftKey:!!event.shiftKey,
+      repeat:!!event.repeat,composing:!!event.isComposing,trusted:!!event.isTrusted,defaultPrevented:!!event.defaultPrevented
     });
-  }, true);
+  }, { capture:true, passive:true });
 
-  window.addEventListener('resize', () => record('resize', { innerWidth:innerWidth,innerHeight:innerHeight,devicePixelRatio }), true);
-  window.addEventListener('scroll', () => record('scroll', { x:scrollX,y:scrollY }), { capture:true, passive:true });
+  window.addEventListener('resize', () => record('resize', { innerWidth,innerHeight,devicePixelRatio }), { passive:true });
+  window.addEventListener('scroll', () => record('scroll', { x:scrollX,y:scrollY }), { capture:true,passive:true });
   if (window.visualViewport) {
-    visualViewport.addEventListener('resize', () => record('visualViewport.resize', { width:visualViewport.width,height:visualViewport.height,scale:visualViewport.scale,offsetLeft:visualViewport.offsetLeft,offsetTop:visualViewport.offsetTop }), { passive:true });
-    visualViewport.addEventListener('scroll', () => record('visualViewport.scroll', { pageLeft:visualViewport.pageLeft,pageTop:visualViewport.pageTop,offsetLeft:visualViewport.offsetLeft,offsetTop:visualViewport.offsetTop }), { passive:true });
+    visualViewport.addEventListener('resize', () => record('visualViewport.resize', {
+      width:visualViewport.width,height:visualViewport.height,scale:visualViewport.scale,
+      offsetLeft:visualViewport.offsetLeft,offsetTop:visualViewport.offsetTop
+    }), { passive:true });
+    visualViewport.addEventListener('scroll', () => record('visualViewport.scroll', {
+      pageLeft:visualViewport.pageLeft,pageTop:visualViewport.pageTop,
+      offsetLeft:visualViewport.offsetLeft,offsetTop:visualViewport.offsetTop
+    }), { passive:true });
   }
 
-  window.addEventListener('storage', event => {
-    record('storage', {
-      key:scrub(event.key || ''),
-      oldValueLength:event.oldValue == null ? -1 : String(event.oldValue).length,
-      newValueLength:event.newValue == null ? -1 : String(event.newValue).length,
-      url:scrub(event.url || '')
-    });
-  }, true);
+  window.addEventListener('storage', event => record('storage', {
+    key:scrub(event.key || ''),
+    oldValueLength:event.oldValue == null ? -1 : String(event.oldValue).length,
+    newValueLength:event.newValue == null ? -1 : String(event.newValue).length,
+    url:scrub(event.url || '')
+  }), { passive:true });
 
-  window.addEventListener('error', event => {
-    record('windowError', {
-      message: scrub(event.message || ''),
-      filename: scrub(event.filename || ''),
-      lineno: event.lineno || 0,
-      colno: event.colno || 0
-    });
-  }, true);
+  window.addEventListener('error', event => record('windowError', {
+    message:scrub(event.message || ''),filename:scrub(event.filename || ''),
+    lineno:event.lineno || 0,colno:event.colno || 0
+  }), true);
 
   window.addEventListener('unhandledrejection', event => {
     let reason = '';
     try { reason = String(event.reason && (event.reason.stack || event.reason.message || event.reason)); } catch (_) {}
-    record('unhandledRejection', { reason: scrub(reason).slice(0, 8000) });
+    record('unhandledRejection', { reason:scrub(reason).slice(0,8000) });
   }, true);
 
-  document.addEventListener('securitypolicyviolation', event => {
-    record('securitypolicyviolation', {
-      blockedURI:scrub(event.blockedURI || ''),
-      violatedDirective:scrub(event.violatedDirective || ''),
-      effectiveDirective:scrub(event.effectiveDirective || ''),
-      originalPolicy:scrub(event.originalPolicy || '').slice(0, 8000),
-      sourceFile:scrub(event.sourceFile || ''),
-      lineNumber:event.lineNumber || 0,
-      columnNumber:event.columnNumber || 0,
-      statusCode:event.statusCode || 0,
-      disposition:scrub(event.disposition || '')
-    });
-  }, true);
-
-  try {
-    for (const method of ['pushState','replaceState']) {
-      const original = history[method];
-      history[method] = function(...args) {
-        const result = original.apply(this, args);
-        record('history.' + method, { url: location.href });
-        return result;
-      };
-    }
-  } catch (error) {
-    record('hookError', { stage: 'history', message: scrub(error && (error.stack || error.message || error)) });
-  }
+  document.addEventListener('securitypolicyviolation', event => record('securitypolicyviolation', {
+    blockedURI:scrub(event.blockedURI || ''),violatedDirective:scrub(event.violatedDirective || ''),
+    effectiveDirective:scrub(event.effectiveDirective || ''),sourceFile:scrub(event.sourceFile || ''),
+    lineNumber:event.lineNumber || 0,columnNumber:event.columnNumber || 0,statusCode:event.statusCode || 0,
+    disposition:scrub(event.disposition || '')
+  }), true);
 
   try {
     if (window.navigation && navigation.addEventListener) {
-      navigation.addEventListener('navigate', event => {
-        record('navigation.navigate', {
-          navigationType:scrub(event.navigationType || ''),
-          canIntercept:!!event.canIntercept,
-          hashChange:!!event.hashChange,
-          downloadRequest:scrub(event.downloadRequest || ''),
-          destination:event.destination ? { url:scrub(event.destination.url || ''),key:scrub(event.destination.key || ''),id:scrub(event.destination.id || ''),index:event.destination.index,sameDocument:!!event.destination.sameDocument } : null
-        });
-      });
+      navigation.addEventListener('navigate', event => record('navigation.navigate', {
+        navigationType:scrub(event.navigationType || ''),canIntercept:!!event.canIntercept,
+        hashChange:!!event.hashChange,downloadRequest:scrub(event.downloadRequest || ''),
+        destination:event.destination ? {
+          url:scrub(event.destination.url || ''),key:scrub(event.destination.key || ''),
+          id:scrub(event.destination.id || ''),index:event.destination.index,sameDocument:!!event.destination.sameDocument
+        } : null
+      }));
       navigation.addEventListener('navigatesuccess', () => record('navigation.navigatesuccess', { url:location.href }));
       navigation.addEventListener('navigateerror', event => record('navigation.navigateerror', { message:scrub(event.message || '') }));
     }
@@ -295,22 +239,20 @@
             } else hook.droppedPerformance++;
           }
         });
-        observer.observe({ type, buffered: true });
+        observer.observe({ type,buffered:true });
         hook.performanceObserverTypes.push(type);
       } catch (_) {}
     }
   } catch (error) {
-    record('hookError', { stage: 'performanceObserver', message: scrub(error && (error.stack || error.message || error)) });
+    record('hookError', { stage:'performanceObserver',message:scrub(error && (error.stack || error.message || error)) });
   }
 
   try {
     if (typeof ReportingObserver === 'function') {
       const reporting = new ReportingObserver(reports => {
-        for (const report of reports) {
-          let body = null;
-          try { body = report.body && typeof report.body.toJSON === 'function' ? report.body.toJSON() : report.body; } catch (_) {}
-          record('browserReport', { reportType:scrub(report.type || ''),url:scrub(report.url || ''),body:body == null ? null : JSON.parse(JSON.stringify(body, (_k,v) => typeof v === 'string' ? scrub(v) : v)) });
-        }
+        for (const report of reports) record('browserReport', {
+          reportType:scrub(report.type || ''),url:scrub(report.url || '')
+        });
       }, { buffered:true });
       reporting.observe();
       hook.reportingObserverInstalled = true;
@@ -320,13 +262,8 @@
   }
 
   record('hookInstalled', {
-    readyState: document.readyState,
-    visibilityState: document.visibilityState,
-    hasFocus:document.hasFocus(),
-    url: location.href,
-    attachShadowPatched: hook.attachShadowPatched,
-    mutationObserverInstalled: hook.mutationObserverInstalled,
-    performanceObserverTypes: hook.performanceObserverTypes,
-    reportingObserverInstalled:hook.reportingObserverInstalled
+    readyState:document.readyState,visibilityState:document.visibilityState,hasFocus:document.hasFocus(),url:location.href,
+    passiveOnly:true,attachShadowPatched:false,mutationObserverInstalled:hook.mutationObserverInstalled,
+    performanceObserverTypes:hook.performanceObserverTypes,reportingObserverInstalled:hook.reportingObserverInstalled
   });
 })();
